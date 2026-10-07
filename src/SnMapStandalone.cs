@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.6";   // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X")
+        public const string Version = "2.7";   // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X")
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -193,6 +193,9 @@ namespace SNMap
         private byte[] modVerBytes;                          // 版本串字节(避免每次写状态都分配)
         private string biomeCnCache;                         // HUD 中文群系(节流, 不必每帧问游戏)
         private int biomeFrame = -1000;
+        private readonly Dictionary<string, string> labelToTech = new Dictionary<string, string>();
+        private bool labelMapBuilt;
+        private readonly Dictionary<string, Texture2D> iconCache = new Dictionary<string, Texture2D>();
 
         private static readonly string[] Headings = new string[]
         {
@@ -474,8 +477,10 @@ namespace SNMap
             List<PingInstance> sorted = new List<PingInstance>();
             foreach (PingInstance pi in list)
             {
-                // PingType.Signal = 扫描室扫描目标: 只显示在小地图, 不发给大地图窗口
-                if (pi != null && pi.visible && pi.pingType != PingType.Signal) sorted.Add(pi);
+                if (pi == null || !pi.visible) continue;
+                // PingType.Signal = 扫描室扫描目标; v4 起也发给大地图(带物品图标), 但设置里可以关
+                if (pi.pingType == PingType.Signal && !showScanSignals) continue;
+                sorted.Add(pi);
             }
             sorted.Sort(delegate(PingInstance a, PingInstance b)
             {
@@ -488,6 +493,7 @@ namespace SNMap
             {
                 PingInstance pi = sorted[i];
                 Vector3 q = pi.GetPosition();
+                bool isScan = pi.pingType == PingType.Signal;
                 int off = Proto.OffBeacons + i * 128;
                 PutFloat(buf, off, q.x);
                 PutFloat(buf, off + 4, q.z);
@@ -498,7 +504,38 @@ namespace SNMap
                 if (b.Length > 63) Array.Resize(ref b, 63);
                 PutInt(buf, off + 16, b.Length);
                 PutBytes(buf, off + 20, b);
+                // 图标键: 扫描信号只有本地化名字(石灰岩块...), 反查成 TechType(Limestone) 才能找到内置图标
+                string key = isScan ? IconKeyForLabel(lbl) : null;
+                byte[] kb = string.IsNullOrEmpty(key) ? new byte[0] : Encoding.UTF8.GetBytes(key);
+                if (kb.Length > 32) Array.Resize(ref kb, 32);
+                PutInt(buf, off + 84, kb.Length);
+                PutBytes(buf, off + 88, kb);
+                buf[off + 120] = isScan ? (byte)1 : (byte)0;
             }
+
+            // 扫描室物品点: 排在真实 ping 之后, 占剩下的槽位(kind=2, 带物品图标键)
+            CollectScannerNodes(pp);
+            int total = n;
+            for (int i = 0; i < scanNodePos.Count && total < Proto.MaxBeacons; i++, total++)
+            {
+                int off = Proto.OffBeacons + total * 128;
+                Vector3 q = scanNodePos[i];
+                PutFloat(buf, off, q.x);
+                PutFloat(buf, off + 4, q.z);
+                PutInt(buf, off + 8, 0);
+                PutInt(buf, off + 12, 1);
+                string nm = scanNodeName[i];
+                byte[] b = string.IsNullOrEmpty(nm) ? new byte[0] : Encoding.UTF8.GetBytes(nm);
+                if (b.Length > 63) Array.Resize(ref b, 63);
+                PutInt(buf, off + 16, b.Length);
+                PutBytes(buf, off + 20, b);
+                byte[] kb2 = Encoding.UTF8.GetBytes(scanNodeKey[i]);
+                if (kb2.Length > 32) Array.Resize(ref kb2, 32);
+                PutInt(buf, off + 84, kb2.Length);
+                PutBytes(buf, off + 88, kb2);
+                buf[off + 120] = 2;
+            }
+            PutInt(buf, Proto.OffBeaconCount, total);
 
             // 攻击性生物(每 20 帧≈0.33秒 扫一次, 取最近 24 只, 600m 内)
             // 原来 60 帧(1秒)一次, 生物位置最多滞后 1 秒, 看起来就是"不刷新"
@@ -545,9 +582,16 @@ namespace SNMap
                     PutFloat(buf, off + 4, q.z);
                     string nm = CreatureName(aggr[i]);
                     byte[] nb = string.IsNullOrEmpty(nm) ? new byte[0] : Encoding.UTF8.GetBytes(nm);
-                    if (nb.Length > 66) Array.Resize(ref nb, 66);
+                    if (nb.Length > 32) Array.Resize(ref nb, 32);
                     PutInt(buf, off + 8, nb.Length);
                     PutBytes(buf, off + 12, nb);
+                    // 图标键 = TechType 名(对应内置的 icons/<key>.png), 大地图窗口拿它画生物头像
+                    TechTag tgi = aggr[i].GetComponent<TechTag>();
+                    string key = tgi != null ? tgi.type.ToString() : null;
+                    byte[] kb = string.IsNullOrEmpty(key) ? new byte[0] : Encoding.UTF8.GetBytes(key);
+                    if (kb.Length > 32) Array.Resize(ref kb, 32);
+                    PutInt(buf, off + 44, kb.Length);
+                    PutBytes(buf, off + 48, kb);
                 }
             }
             catch (Exception ex)
@@ -570,6 +614,128 @@ namespace SNMap
             if (creatureShow != null) return tg != null && creatureShow.Contains(tg.type.ToString());
             if (Cfg.CreatureWhitelist == null) return true;
             return tg != null && Cfg.CreatureWhitelist.Contains(tg.type);
+        }
+
+        // ---- 扫描室(Scanner Room)物品点 ----
+        // 游戏里那些"某某物品在哪"的点不走 PingManager(PingType 里根本没有资源类型),
+        // 真正数据在 MapRoomFunctionality / ResourceTrackerDatabase 里, 而且 ResourceInfo 是 internal,
+        // 所以下面用反射取节点。全部 try/catch 兜住: 取不到就当作没有, 不影响其它功能。
+        private readonly List<Vector3> scanNodePos = new List<Vector3>();
+        private readonly List<string> scanNodeKey = new List<string>();
+        private readonly List<string> scanNodeName = new List<string>();
+        private int lastScannerFrame;
+        private bool scannerApiReady;
+        private Type riType;                    // ResourceTrackerDatabase/ResourceInfo
+        private MethodInfo getNodesM;           // static GetNodes(Vector3,float,TechType,ICollection<ResourceInfo>)
+        private Type nodeListType;              // List<ResourceInfo>
+        private FieldInfo riTechF, riPosF;
+
+        private void CollectScannerNodes(Vector3 pp)
+        {
+            scanNodePos.Clear();
+            scanNodeKey.Clear();
+            scanNodeName.Clear();
+            if (frame % 30 != 0 && lastScannerFrame != 0 && frame - lastScannerFrame < 30) return;
+            lastScannerFrame = frame;
+            try
+            {
+                MapRoomFunctionality[] rooms = UnityEngine.Object.FindObjectsOfType<MapRoomFunctionality>();
+                if (rooms == null || rooms.Length == 0) return;
+                MapRoomFunctionality room = rooms[0];
+                float range = room.GetScanRange();
+                Vector3 rp = room.transform.position;
+
+                List<TechType> types = new List<TechType>();
+                ResourceTrackerDatabase.GetTechTypesInRange(rp, range, types);
+                if (types.Count == 0) return;
+
+                if (!scannerApiReady)
+                {
+                    scannerApiReady = true;
+                    Type dbType = typeof(ResourceTrackerDatabase);
+                    MethodInfo[] ms = dbType.GetMethods(BindingFlags.Public | BindingFlags.Static);
+                    for (int i = 0; i < ms.Length; i++)
+                    {
+                        if (ms[i].Name != "GetNodes") continue;
+                        ParameterInfo[] ps = ms[i].GetParameters();
+                        if (ps.Length == 4) { getNodesM = ms[i]; break; }
+                    }
+                    if (getNodesM != null)
+                    {
+                        riType = getNodesM.GetParameters()[3].ParameterType.GetGenericArguments()[0];
+                        nodeListType = typeof(List<>).MakeGenericType(riType);
+                        riTechF = riType.GetField("techType");
+                        riPosF = riType.GetField("position");
+                    }
+                    Cfg.Log("scanner api: GetNodes=" + (getNodesM != null) + " resourceInfo=" + (riType != null));
+                }
+                if (getNodesM == null || riType == null) return;
+
+                for (int t = 0; t < types.Count && scanNodePos.Count < 48; t++)
+                {
+                    System.Collections.IList nodes = (System.Collections.IList)Activator.CreateInstance(nodeListType);
+                    getNodesM.Invoke(null, new object[] { rp, range, types[t], nodes });
+                    for (int i = 0; i < nodes.Count && scanNodePos.Count < 48; i++)
+                    {
+                        object info = nodes[i];
+                        TechType tt = (TechType)riTechF.GetValue(info);
+                        Vector3 pos = (Vector3)riPosF.GetValue(info);
+                        if ((pos - pp).sqrMagnitude > 360000f) continue;      // 600m 内才画
+                        scanNodePos.Add(pos);
+                        scanNodeKey.Add(tt.ToString());
+                        string cn = null;
+                        try { cn = Language.main.Get(tt.AsString()); } catch (Exception) { }
+                        scanNodeName.Add(string.IsNullOrEmpty(cn) ? tt.ToString() : cn);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (frame % 1800 == 0) Cfg.Log("scanner nodes failed: " + ex.Message);
+            }
+        }
+
+        // 建立"本地化物品名 -> TechType 名"反查表(扫描室的 ping 只有中文名, 没有 TechType)。
+        // 只在第一次需要时建一次, 之后走字典。
+        private string IconKeyForLabel(string lbl)
+        {
+            if (string.IsNullOrEmpty(lbl)) return null;
+            if (!labelMapBuilt)
+            {
+                labelMapBuilt = true;
+                try
+                {
+                    Array vals = Enum.GetValues(typeof(TechType));
+                    for (int i = 0; i < vals.Length; i++)
+                    {
+                        TechType tt = (TechType)vals.GetValue(i);
+                        string cn = null;
+                        try { cn = Language.main.Get(tt.AsString()); } catch (Exception) { }
+                        if (!string.IsNullOrEmpty(cn) && !labelToTech.ContainsKey(cn)) labelToTech[cn] = tt.ToString();
+                    }
+                    Cfg.Log("icon label map built: " + labelToTech.Count + " 条");
+                }
+                catch (Exception ex) { Cfg.Log("icon label map failed: " + ex.Message); }
+            }
+            string k;
+            return labelToTech.TryGetValue(lbl, out k) ? k : null;
+        }
+
+        // 内置图标(icons/<TechType>.png)按需加载 + 缓存; 缺图标就返回 null, 调用方退回原来的点/三角
+        private Texture2D GetIconTex(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return null;
+            Texture2D t;
+            if (iconCache.TryGetValue(key, out t)) return t;
+            if (iconCache.Count >= 128) return null;     // 别把纹理无限堆着
+            try
+            {
+                string p = Path.Combine(Cfg.BaseDir, Path.Combine("icons", key + ".png"));
+                t = File.Exists(p) ? LoadTexture(p) : null;
+            }
+            catch (Exception) { t = null; }
+            iconCache[key] = t;
+            return t;
         }
 
         private static string CreatureName(Creature c)
@@ -855,20 +1021,53 @@ namespace SNMap
                     if (Vector2.Distance(new Vector2(sx, sy), sq.center) > D * 0.5f - 13f) continue;
                     bool isScan = pi.pingType == PingType.Signal;   // 扫描室扫描目标
                     if (isScan && !showScanSignals) continue;       // 设置窗口里可关掉
-                    if (isScan) GUI.color = new Color(1f, 0.62f, 0.1f);
+                    Texture2D ico = isScan ? GetIconTex(IconKeyForLabel(pi.GetLabel())) : null;
+                    if (ico != null)
+                    {
+                        GUI.color = Color.white;
+                        GUI.DrawTexture(new Rect(sx - 9f, sy - 9f, 18f, 18f), ico);
+                    }
+                    else if (isScan)
+                    {
+                        GUI.color = new Color(1f, 0.62f, 0.1f);
+                        GUI.DrawTexture(new Rect(sx - 5f, sy - 5f, 10f, 10f), dotTex);
+                        GUI.color = Color.white;
+                    }
                     else
                     {
                         int ci = pi.colorIndex >= 0 ? pi.colorIndex : 0;
                         GUI.color = colors[ci % colors.Length];
+                        GUI.DrawTexture(new Rect(sx - 5f, sy - 5f, 10f, 10f), dotTex);
+                        GUI.color = Color.white;
                     }
-                    GUI.DrawTexture(new Rect(sx - 5f, sy - 5f, 10f, 10f), dotTex);
-                    GUI.color = Color.white;
                     if (isScan)
                     {
                         string lbl = pi.GetLabel();
                         if (!string.IsNullOrEmpty(lbl))
                             LabelShadowed(new Rect(sx + 7f, sy - 7f, 200f, 18f), lbl, miniSignalStyle);
                     }
+                }
+            }
+
+            // 扫描室物品点(带物品图标; 没有图标就画小黄点)
+            for (int i = 0; i < scanNodePos.Count; i++)
+            {
+                Vector3 q = scanNodePos[i];
+                if (q.x < winX0 || q.x > winX0 + spanWorld || q.z < winZ0 || q.z > winZ0 + spanWorld) continue;
+                float nx = sq.x + (q.x - winX0) / spanWorld * D;
+                float ny = sq.y + (1f - (q.z - winZ0) / spanWorld) * D;
+                if (Vector2.Distance(new Vector2(nx, ny), sq.center) > D * 0.5f - 12f) continue;
+                Texture2D nico = GetIconTex(scanNodeKey[i]);
+                if (nico != null)
+                {
+                    GUI.color = Color.white;
+                    GUI.DrawTexture(new Rect(nx - 8f, ny - 8f, 16f, 16f), nico);
+                }
+                else
+                {
+                    GUI.color = new Color(1f, 0.85f, 0.2f);
+                    GUI.DrawTexture(new Rect(nx - 4f, ny - 4f, 8f, 8f), dotTex);
+                    GUI.color = Color.white;
                 }
             }
 

@@ -54,12 +54,15 @@ internal class Beacon
     public float X, Z;
     public int Color;
     public string Label;
+    public string Key;    // 图标键(icons/<Key>.png); 空=画彩色点
+    public int Kind;      // 0=信标 1=扫描室扫描信号
 }
 
 internal class CreaturePt
 {
     public float X, Z;
     public string Label;
+    public string Key;    // 图标键(生物 TechType); 空=画红三角
 }
 
 public class MapForm : Form
@@ -767,6 +770,8 @@ public class MapForm : Form
                 bk.Z = GetFloat(buf, off + 4);
                 bk.Color = GetInt(buf, off + 8);
                 bk.Label = GetString(buf, off + 16, off + 20, 63);
+                bk.Key = GetString(buf, off + 84, off + 88, 32);
+                bk.Kind = buf[off + 120];
                 beacons.Add(bk);
             }
             int cn = ClampI(GetInt(buf, OffCreatureCount), 0, Proto.MaxCreatures);
@@ -778,7 +783,8 @@ public class MapForm : Form
                 else { c = new CreaturePt(); creatureFree.Add(c); }
                 c.X = GetFloat(buf, off);
                 c.Z = GetFloat(buf, off + 4);
-                c.Label = GetString(buf, off + 8, off + 12, 66);
+                c.Label = GetString(buf, off + 8, off + 12, 32);
+                c.Key = GetString(buf, off + 44, off + 48, 32);
                 creatureWin.Add(c);
             }
             // 模块见过的敌对物种清单(设置窗口右侧列表用)
@@ -999,10 +1005,21 @@ public class MapForm : Form
             {
                 PointF sp = WorldToScreen(L, bk.X, bk.Z);
                 if (sp.X < r.X - 40f || sp.Y < r.Y - 40f || sp.X > r.Right + 40f || sp.Y > r.Bottom + 40f) continue;
-                g.FillEllipse(PingBrush(bk.Color), sp.X - 6f, sp.Y - 6f, 12f, 12f);
-                g.DrawEllipse(beaconPen, sp.X - 6f, sp.Y - 6f, 12f, 12f);
+                Image bic = GetIcon(bk.Key);
+                if (bic != null)
+                {
+                    // 扫描室扫描的物品: 直接画游戏里的物品图标
+                    Rectangle ir = new Rectangle((int)(sp.X - 10f), (int)(sp.Y - 10f), 20, 20);
+                    g.FillRectangle(shadowBrush, ir);
+                    g.DrawImage(bic, ir);
+                }
+                else
+                {
+                    g.FillEllipse(bk.Kind != 0 ? creatureBrush : PingBrush(bk.Color), sp.X - 6f, sp.Y - 6f, 12f, 12f);
+                    g.DrawEllipse(beaconPen, sp.X - 6f, sp.Y - 6f, 12f, 12f);
+                }
                 if (!string.IsNullOrEmpty(bk.Label))
-                    DrawShadowText(g, bk.Label, mapFont, sp.X + 9f, sp.Y - 10f);
+                    DrawShadowText(g, bk.Label, bic != null ? smallFont : mapFont, sp.X + 11f, sp.Y - 10f);
             }
 
             if (hasGame)
@@ -1027,13 +1044,24 @@ public class MapForm : Form
                 {
                     PointF cp = WorldToScreen(L, c.X, c.Z);
                     if (cp.X < r.X - 20f || cp.Y < r.Y - 20f || cp.X > r.Right + 20f || cp.Y > r.Bottom + 20f) continue;
-                    PointF[] tri = new PointF[]
+                    Image cic = GetIcon(c.Key);
+                    if (cic != null)
                     {
-                        new PointF(cp.X, cp.Y - 9f), new PointF(cp.X + 8f, cp.Y + 7f), new PointF(cp.X - 8f, cp.Y + 7f)
-                    };
-                    g.FillPolygon(creatureBrush, tri);
+                        // 生物头像(内置 icons/<TechType>.png)
+                        Rectangle ir = new Rectangle((int)(cp.X - 12f), (int)(cp.Y - 12f), 24, 24);
+                        g.FillRectangle(shadowBrush, ir);
+                        g.DrawImage(cic, ir);
+                    }
+                    else
+                    {
+                        PointF[] tri = new PointF[]
+                        {
+                            new PointF(cp.X, cp.Y - 9f), new PointF(cp.X + 8f, cp.Y + 7f), new PointF(cp.X - 8f, cp.Y + 7f)
+                        };
+                        g.FillPolygon(creatureBrush, tri);
+                    }
                     if (!string.IsNullOrEmpty(c.Label))
-                        DrawShadowText(g, c.Label, smallFont, cp.X + 10f, cp.Y - 8f);
+                        DrawShadowText(g, c.Label, smallFont, cp.X + 13f, cp.Y - 8f);
                 }
             }
 
@@ -1082,6 +1110,25 @@ public class MapForm : Form
             h = h * 31 + (int)(c.X * 8f) * 7 + (int)(c.Z * 8f) * 13;
         }
         return h;
+    }
+
+    // 内置图标(icons/<TechType>.png)按需加载 + 缓存; 没有图标就退回原来的点/三角
+    private readonly Dictionary<string, Image> iconCache = new Dictionary<string, Image>();
+
+    private Image GetIcon(string key)
+    {
+        if (string.IsNullOrEmpty(key)) return null;
+        Image img;
+        if (iconCache.TryGetValue(key, out img)) return img;
+        if (iconCache.Count >= 256) return null;
+        try
+        {
+            string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, Path.Combine("icons", key + ".png"));
+            img = File.Exists(p) ? Image.FromFile(p) : null;
+        }
+        catch (Exception) { img = null; }
+        iconCache[key] = img;
+        return img;
     }
 
     private SolidBrush PingBrush(int idx)

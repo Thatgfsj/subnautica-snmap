@@ -20,7 +20,7 @@ namespace SNMap
         public const string KeyShowScanSignals = "ShowScanSignals";
         public const string KeyCreatureShow = "CreatureShow";   // 逗号分隔的 TechType 名(要显示的物种); "*"=全部
 
-        public const int Version = 3;           // v3: 增加物种清单(OffSpecies*)与两个新设置键
+        public const int Version = 4;           // v4: 信标/生物记录里加"图标键"(icons/<TechType>.png), 扫描信号也进大地图
         public const int Magic = 0x534E4D50;
         public const int StateSize = 8192;      // 状态文件固定长度(窗口复用读缓冲要用)
 
@@ -39,10 +39,11 @@ namespace SNMap
         public const int OffBiomeLen = 84;      // int
         public const int OffBiome = 88;         // 64B utf8
         public const int OffBeacons = 160;      // 32 * 128B: x(f) z(4f) color(8i) visible(12i) labelLen(16i) label(20+63B)
+                                                //            图标键: keyLen(84i) key(88+32B)  类型: kind(120B) 0=信标 1=扫描信号
         public const int OffWindowLayerEcho = 4256; // int  模块回显(读自设置)
         public const int OffMinimapPixelsEcho = 4260; // int 模块回显
         public const int OffCreatureCount = 4268; // int 模块->窗口
-        public const int OffCreatures = 4272;   // 24 * 80B: x(f) z(4f) labelLen(8i) label(12+66B)
+        public const int OffCreatures = 4272;   // 24 * 80B: x(f) z(4f) labelLen(8i) label(12+32B) keyLen(44i) key(48+32B)
         public const int OffSpeciesCount = 6200; // int  模块见过的敌对物种数(供设置窗口列出全部敌对生物)
         public const int OffSpecies = 6204;     // 40 * 32B: nameLen(i) + utf8 TechType 名(<=28B)
 
