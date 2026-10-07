@@ -619,7 +619,8 @@ public class MapForm : Form
 
     private static string Heading8(float deg)
     {
-        return Headings[ClampI((int)Math.Round(deg / 45f), 0, 359) / 45 % 8];
+        // 旧写法 ClampI(round(deg/45),0,359)/45%8 又除了一次 45, 结果永远显示 "N 北"
+        return Headings[((int)Math.Round(deg / 45f) % 8 + 8) % 8];
     }
 
     private static int GetInt(byte[] b, int off)
@@ -654,18 +655,20 @@ public class MapForm : Form
         return Math.Min(r.Width / w, r.Height / h);
     }
 
+    // 全工具统一坐标系: +X=东=屏幕右, +Z=北=屏幕上(地图图片上方=北=MaxZ)
+    // 历史 bug: 这里把 +Z 当成屏幕下方, 于是底图采到的是"南北镜像"的区域, 而且叠加层与底图各用一套约定。
     private PointF WorldToScreen(MapLayer L, float wx, float wz)
     {
         Rectangle r = MapArea();
         float s = FitScale(L) * zoom;
-        return new PointF(r.Width / 2f + (wx - viewCX) * s, r.Height / 2f + (wz - viewCZ) * s);
+        return new PointF(r.X + r.Width / 2f + (wx - viewCX) * s, r.Y + r.Height / 2f - (wz - viewCZ) * s);
     }
 
     private PointF ScreenToWorldPt(MapLayer L, PointF sp)
     {
         Rectangle r = MapArea();
         float s = FitScale(L) * zoom;
-        return new PointF(viewCX + (sp.X - r.Width / 2f) / s, viewCZ + (sp.Y - r.Height / 2f) / s);
+        return new PointF(viewCX + (sp.X - (r.X + r.Width / 2f)) / s, viewCZ - (sp.Y - (r.Y + r.Height / 2f)) / s);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -691,19 +694,22 @@ public class MapForm : Form
             return;
         }
 
-        // 从 mip 金字塔选一级(分辨率最接近屏幕), 抠出当前视野做块拷贝
+        // 从 mip 金字塔选一级: MipPxPerM 存的是"米/像素", 取"不比屏幕更粗"里最粗的一级。
+        // 旧条件拿 米/像素 和 屏幕像素/米 比大小(量纲都不对), 放大后反而挑中最糊的那级 -> 高倍缩放一片糊。
         g.InterpolationMode = InterpolationMode.Bilinear;
         g.PixelOffsetMode = PixelOffsetMode.Half;
         float vs = FitScale(L) * zoom;
-        int mi = L.Mips.Length - 1;
+        float targetMPerPx = 1f / Math.Max(vs, 0.0001f);   // 屏幕上一像素代表多少米
+        int mi = 0;                                       // 默认用最细一级(比屏幕还细时就是它)
         for (int i = 0; i < L.Mips.Length; i++)
         {
-            if (L.MipPxPerM[i] >= vs) { mi = i; break; }
+            if (L.MipPxPerM[i] <= targetMPerPx) mi = i; else break;
         }
         float cs = L.MipPxPerM[mi];
+        // 目标矩形上边缘对应世界 z 最大(北)一侧 -> 取图片中该 z 所在的行
         RectangleF src = new RectangleF(
             (viewCX - r.Width / 2f / vs - L.MinX) / cs,
-            (viewCZ - r.Height / 2f / vs - L.MinZ) / cs,
+            (L.MaxZ - (viewCZ + r.Height / 2f / vs)) / cs,
             r.Width / vs / cs,
             r.Height / vs / cs);
         g.DrawImage(L.Mips[mi], r, src, GraphicsUnit.Pixel);
@@ -725,8 +731,8 @@ public class MapForm : Form
                 PointF pp = WorldToScreen(L, px, pz);
                 GraphicsState state = g.Save();
                 g.TranslateTransform(pp.X, pp.Y);
-                // GDI+ 正角度=顺时针, 与游戏内 IMGUI(逆时针)相反, 故取负号保证两边一致
-                g.RotateTransform(-heading);
+                // 箭头图形本身指向正上方(北); GDI+ 正角度=顺时针, 正好等于罗盘方位角的正方向
+                g.RotateTransform(heading);
                 PointF[] pts = new PointF[]
                 {
                     new PointF(0f, -13f), new PointF(9f, 11f), new PointF(0f, 6f), new PointF(-9f, 11f)
@@ -814,7 +820,7 @@ public class MapForm : Form
         base.OnMouseWheel(e);
         MapLayer L = Layer();
         if (L == null || !L.Calibrated) return;
-        PointF sp = new PointF(e.X, e.Y - MapArea().Y);
+        PointF sp = new PointF(e.X, e.Y);   // ScreenToWorldPt 现在按客户区坐标(与 WorldToScreen 同一套)
         PointF before = ScreenToWorldPt(L, sp);
         zoom = Math.Max(1f, Math.Min(32f, zoom * (e.Delta > 0 ? 1.2f : 1 / 1.2f)));
         PointF after = ScreenToWorldPt(L, sp);
@@ -843,7 +849,7 @@ public class MapForm : Form
             if (L == null || !L.Calibrated) return;
             float s = FitScale(L) * zoom;
             viewCX -= (e.X - lastMouse.X) / s;
-            viewCZ -= (e.Y - lastMouse.Y) / s;
+            viewCZ += (e.Y - lastMouse.Y) / s;   // +Z 是屏幕上方, 往下拖 = 视野往北移(内容跟着鼠标走)
             lastMouse = e.Location;
             if (follow)
             {

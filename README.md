@@ -5,7 +5,14 @@ A trainer-style minimap & standalone map window for **Subnautica (Steam, x64)**.
 
 > 仅用于单人游戏与学习交流。请勿用于任何联机对抗场景。
 
-当前版本：**v2.2**
+当前版本：**v2.3**
+
+## 坐标系约定（改代码必读）
+
+- 世界 `+X = 东 = 屏幕右`，`+Z = 北 = 屏幕上`；地图图片上方即北（`MaxZ`），图片行号 `r = (1-v)*H`，`v = (z-MinZ)/(MaxZ-MinZ)`
+- 世界→屏幕：`sx = 窗口西边界 + (wx-winX0)/span*D`，`sy = 窗口南边界 + (1 - (wz-winZ0)/span)*D`
+- 玩家朝向 = 罗盘方位角 `θ = atan2(camera.forward.x, camera.forward.z)`（0=北、90=东、顺时针）；Unity GUI 与 GDI+ 的正角度都是顺时针，两边都直接用 θ
+- 底图与叠加层（箭头/信标/生物）必须用**同一套换算**；小地图贴到图层边缘被 clamp 时，箭头要按窗口原点算、不能钉死在圆心
 
 ## 功能
 

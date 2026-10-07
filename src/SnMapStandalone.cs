@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.2";   // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X")
+        public const string Version = "2.3";   // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X")
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -164,7 +164,7 @@ namespace SNMap
 
     public class SnMapBehaviour : MonoBehaviour
     {
-        private Texture2D arrowTex;
+        private Texture2D whiteTex;
         private Texture2D dotTex;
         private Texture2D ringTex;
         private Font uiFont;
@@ -205,7 +205,7 @@ namespace SNMap
         private void Awake()
         {
             LoadFont();
-            BuildArrowTexture();
+            BuildWhiteTexture();
             BuildDotTexture();
             BuildRingTexture(Cfg.MinimapPixels);
             LoadLayers();
@@ -688,11 +688,16 @@ namespace SNMap
             float su = spanWorld / (L.MaxX - L.MinX);
             float sv = spanWorld / (L.MaxZ - L.MinZ);
 
+            // 全工具统一坐标系: +X=东=屏幕右, +Z=北=屏幕上; 地图图片上方=北(=MaxZ), 图片行号 r=(1-v)*H
+            // 历史 bug: 这里曾把 v 轴上下写反, 于是小地图画的是"南北镜像"的位置(人在南半边, 图上显示北半边),
+            //          叠加层(信号点)又用另一套约定, 两者还对不上。下面统一成一套。
             Vector3 p = pl.transform.position;
             float uc = (p.x - L.MinX) / (L.MaxX - L.MinX);
-            float vc = (p.z - L.MinZ) / (L.MaxZ - L.MinZ);
+            float vc = (p.z - L.MinZ) / (L.MaxZ - L.MinZ);   // v: 自南边界起算的北向比例
             float u0 = Mathf.Clamp(uc - su * 0.5f, 0f, 1f - su);
-            float v0 = Mathf.Clamp(vc - sv * 0.5f, 0f, 1f - sv);
+            float v0 = Mathf.Clamp(vc - sv * 0.5f, 0f, 1f - sv);   // 窗口南边界(v)
+            float winX0 = L.MinX + u0 * (L.MaxX - L.MinX);         // 窗口西边界(世界 x)
+            float winZ0 = L.MinZ + v0 * (L.MaxZ - L.MinZ);         // 窗口南边界(世界 z)
 
             // 圆形小地图: 逐列切片绘制, 圆外完全透明(露出游戏画面)
             float cx = D * 0.5f, cy = D * 0.5f, R = D * 0.5f;
@@ -707,9 +712,10 @@ namespace SNMap
                 float yy = cy - half;
                 float hh = half * 2f;
                 float u = u0 + (c / D) * su;
-                float vTop = v0 + (yy / D) * sv;
-                float vBot = v0 + ((yy + hh) / D) * sv;
-                Rect uvr = new Rect(u, 1f - vBot, su / D, vBot - vTop);
+                // 屏幕上方=北=v 大。贴图 texcoords 的 y 从图片底部量起, 所以 rect 的 y 取下方那条边
+                float vLow = v0 + sv * (1f - (yy + hh) / D);
+                float vHigh = v0 + sv * (1f - yy / D);
+                Rect uvr = new Rect(u, vLow, su / D, vHigh - vLow);
                 Rect sr = new Rect(sq.x + c, sq.y + yy, 1.05f, hh);
                 GUI.DrawTextureWithTexCoords(sr, L.Tex, uvr, false);
             }
@@ -719,16 +725,15 @@ namespace SNMap
             List<PingInstance> list = GetPings();
             if (list != null)
             {
-                float halfX = spanWorld * 0.5f, halfZ = spanWorld * 0.5f;
                 for (int i = 0; i < list.Count; i++)
                 {
                     PingInstance pi = list[i];
                     if (pi == null || !pi.visible) continue;
                     Vector3 q = pi.GetPosition();
-                    float dx = q.x - p.x, dz = q.z - p.z;
-                    if (Mathf.Abs(dx) > halfX || Mathf.Abs(dz) > halfZ) continue;
-                    float sx = sq.x + (0.5f + dx / spanWorld) * D;
-                    float sy = sq.y + (0.5f + dz / spanWorld) * D;
+                    // 与地图底图用同一套世界→屏幕换算(窗口可能因贴边被 clamp, 所以按窗口原点算, 不按玩家算)
+                    if (q.x < winX0 || q.x > winX0 + spanWorld || q.z < winZ0 || q.z > winZ0 + spanWorld) continue;
+                    float sx = sq.x + (q.x - winX0) / spanWorld * D;
+                    float sy = sq.y + (1f - (q.z - winZ0) / spanWorld) * D;
                     if (Vector2.Distance(new Vector2(sx, sy), sq.center) > D * 0.5f - 13f) continue;
                     bool isScan = pi.pingType == PingType.Signal;   // 扫描室扫描目标
                     if (isScan) GUI.color = new Color(1f, 0.62f, 0.1f);
@@ -748,11 +753,11 @@ namespace SNMap
                 }
             }
 
-            float ang = HeadingAngle();
-            Matrix4x4 old = GUI.matrix;
-            GUIUtility.RotateAroundPivot(ang, sq.center);
-            GUI.DrawTexture(new Rect(sq.center.x - 9f, sq.center.y - 9f, 18f, 18f), arrowTex);
-            GUI.matrix = old;
+            // 玩家箭头: 位置按同一套换算(贴图层边缘被 clamp 时会离开圆心, 这样才对得上底图);
+            // 方向不用 GUI 旋转矩阵(受 GUI 矩阵/缩放影响不可控), 自己在屏幕空间算三角形逐行填充
+            float psx = sq.x + (p.x - winX0) / spanWorld * D;
+            float psy = sq.y + (1f - (p.z - winZ0) / spanWorld) * D;
+            DrawPlayerArrow(psx, psy, HeadingAngle());
 
             LabelShadowed(new Rect(sq.center.x - 20f, sq.y + 4f, 40f, 20f), "N", smallStyle);
             LabelShadowed(new Rect(sq.x, sq.yMax + 2f, 340f, 22f),
@@ -773,7 +778,8 @@ namespace SNMap
         }
 
         // 朝向: 用渲染相机 (Player.main.transform 不随视角旋转!)
-        // 实测 MainCamera.camera 的 forward 与实际视线方向相反(经验修正 +180)
+        // 返回罗盘方位角: 0=北(+Z), 90=东(+X), 顺时针。atan2(东分量, 北分量) 才是方位角。
+        // 旧代码写成 atan2(f.x, -f.z) + 180 (= -方位角) 是东西镜像的, 与地图对齐后必须改回。
         private static float HeadingAngle()
         {
             Vector3 f = Vector3.zero;
@@ -784,7 +790,7 @@ namespace SNMap
             }
             catch (Exception) { }
             if (f.sqrMagnitude < 0.000001f) return 0f;
-            float a = Mathf.Atan2(f.x, -f.z) * Mathf.Rad2Deg + 180f;
+            float a = Mathf.Atan2(f.x, f.z) * Mathf.Rad2Deg;
             if (a < 0f) a += 360f;
             if (a >= 360f) a -= 360f;
             return a;
@@ -898,60 +904,65 @@ namespace SNMap
         }
 
         // 与大地图窗口相同的风筝形箭头(顶点朝上), 红底黑边
-        private void BuildArrowTexture()
+        private void BuildWhiteTexture()
         {
-            int w = 26, h = 26;
-            float[] xs = new float[] { 13f, 22f, 13f, 4f };
-            float[] ys = new float[] { 0f, 23f, 16f, 23f };
-            bool[] solid = new bool[w * h];
-            for (int y = 0; y < h; y++)
-            {
-                float scanY = y + 0.5f;
-                float minX = 1e9f, maxX = -1e9f;
-                bool any = false;
-                for (int i = 0; i < 4; i++)
-                {
-                    int j = (i + 1) % 4;
-                    float y0 = ys[i], y1 = ys[j];
-                    if ((y0 <= scanY && y1 > scanY) || (y1 <= scanY && y0 > scanY))
-                    {
-                        float t = (scanY - y0) / (y1 - y0);
-                        float x = xs[i] + (xs[j] - xs[i]) * t;
-                        any = true;
-                        if (x < minX) minX = x;
-                        if (x > maxX) maxX = x;
-                    }
-                }
-                if (!any) continue;
-                for (int x = 0; x < w; x++)
-                {
-                    float xm = x + 0.5f;
-                    if (xm >= minX - 0.5f && xm <= maxX + 0.5f) solid[y * w + x] = true;
-                }
-            }
+            whiteTex = new Texture2D(1, 1, TextureFormat.RGBA32, false);
+            whiteTex.SetPixel(0, 0, Color.white);
+            whiteTex.Apply();
+        }
 
-            Color32[] px = new Color32[w * h];
-            Color32 main = new Color32(255, 70, 70, 235);
-            Color32 edge = new Color32(10, 10, 10, 220);
-            for (int y = 0; y < h; y++)
+        // 玩家箭头: 在屏幕空间自己算三角形 + 逐扫描线填充。
+        // 不用 GUIUtility.RotateAroundPivot —— 旋转结果会受游戏 GUI 矩阵/缩放影响, 方向不可控(旧版实测偏移很大)。
+        // bearingDeg: 0=北=屏幕上方, 顺时针为正。
+        private void DrawPlayerArrow(float cx, float cy, float bearingDeg)
+        {
+            if (whiteTex == null) return;
+            float rad = bearingDeg * Mathf.Deg2Rad;
+            float dx = Mathf.Sin(rad), dy = -Mathf.Cos(rad);   // 屏幕方向(右=+x, 下=+y)
+            float px = -dy, py = dx;                            // 方向的右手垂直
+            float L = 9f, B = 5.5f, W = 6.5f;                   // 尖端前伸 / 尾部后缩 / 半宽(像素)
+            float tx = cx + dx * L, ty = cy + dy * L;
+            float ax = cx - dx * B + px * W, ay = cy - dy * B + py * W;
+            float bx = cx - dx * B - px * W, by = cy - dy * B - py * W;
+            float gx = (tx + ax + bx) / 3f, gy = (ty + ay + by) / 3f;
+            const float k = 1.35f;                             // 先画放大一圈的暗色描边, 再画红色填充
+            FillTriangle(gx + (tx - gx) * k, gy + (ty - gy) * k,
+                         gx + (ax - gx) * k, gy + (ay - gy) * k,
+                         gx + (bx - gx) * k, gy + (by - gy) * k,
+                         new Color(0.04f, 0.04f, 0.04f, 0.9f));
+            FillTriangle(tx, ty, ax, ay, bx, by, new Color(1f, 0.27f, 0.27f, 0.95f));
+        }
+
+        private void FillTriangle(float x0, float y0, float x1, float y1, float x2, float y2, Color col)
+        {
+            if (whiteTex == null) return;
+            float yMin = Mathf.Min(y0, Mathf.Min(y1, y2));
+            float yMax = Mathf.Max(y0, Mathf.Max(y1, y2));
+            int r0 = Mathf.FloorToInt(yMin), r1 = Mathf.CeilToInt(yMax);
+            Color old = GUI.color;
+            GUI.color = col;
+            for (int r = r0; r <= r1; r++)
             {
-                for (int x = 0; x < w; x++)
-                {
-                    int idx = y * w + x;
-                    if (solid[idx]) { px[idx] = main; continue; }
-                    bool near = false;
-                    for (int dy2 = -1; dy2 <= 1 && !near; dy2++)
-                        for (int dx2 = -1; dx2 <= 1 && !near; dx2++)
-                        {
-                            int nx = x + dx2, ny = y + dy2;
-                            if (nx >= 0 && ny >= 0 && nx < w && ny < h && solid[ny * w + nx]) near = true;
-                        }
-                    if (near) px[idx] = edge;
-                }
+                float yc = r + 0.5f;
+                float xMin = float.MaxValue, xMax = float.MinValue;
+                EdgeX(x0, y0, x1, y1, yc, ref xMin, ref xMax);
+                EdgeX(x1, y1, x2, y2, yc, ref xMin, ref xMax);
+                EdgeX(x2, y2, x0, y0, yc, ref xMin, ref xMax);
+                if (xMin > xMax) continue;
+                GUI.DrawTexture(new Rect(xMin, r, Mathf.Max(1f, xMax - xMin), 1f), whiteTex);
             }
-            arrowTex = new Texture2D(w, h, TextureFormat.RGBA32, false);
-            arrowTex.SetPixels32(px);
-            arrowTex.Apply();
+            GUI.color = old;
+        }
+
+        private static void EdgeX(float ax, float ay, float bx, float by, float yc, ref float xMin, ref float xMax)
+        {
+            if ((ay <= yc && by > yc) || (by <= yc && ay > yc))
+            {
+                float t = (yc - ay) / (by - ay);
+                float x = ax + (bx - ax) * t;
+                if (x < xMin) xMin = x;
+                if (x > xMax) xMax = x;
+            }
         }
 
         private void BuildDotTexture()
