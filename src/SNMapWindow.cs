@@ -63,6 +63,20 @@ public class MapForm : Form
     private bool mmfTried;
     private bool lastShowFlag;
     private bool firstTick = true;
+
+    // 绘制缓存: 按缩放档位预缩放的图层位图, 避免每帧缩放原始大图
+    private Bitmap cacheBmp;
+    private MapLayer cacheLayer;
+    private int cacheBucket = -1;
+    private Size cachePixelSize;
+
+    // 脏检查: 状态没变化就不重绘
+    private float lastPx = float.MinValue, lastPz = float.MinValue, lastHeading = float.MinValue;
+    private int lastBeaconKey = -1;
+    private bool lastHasGame;
+    private string lastBiome = "";
+    private readonly List<Beacon> beaconBuf = new List<Beacon>();
+    private SolidBrush[] pingBrushes;
     private float worldRange = 2000f;
     private bool exiting;
 
@@ -446,11 +460,80 @@ public class MapForm : Form
         {
             viewCX = px;
             viewCZ = pz;
+            ClampView();
         }
         lblInfo.Text = hasGame
             ? string.Format("X {0:F0}   Z {1:F0}   深度 {2:F0}m   {3}   {4}", px, pz, py, Heading8(heading), biome)
             : "等待游戏数据 (启动游戏并注入 SNMap 后自动连接)";
-        Invalidate();
+
+        // 脏检查: 状态没变化就不重绘(跟随移动/转向/信标增减才算变化)
+        if (Visible)
+        {
+            bool changed = hasGame != lastHasGame
+                || biome != lastBiome
+                || Math.Abs(px - lastPx) > 0.01f
+                || Math.Abs(pz - lastPz) > 0.01f
+                || Math.Abs(heading - lastHeading) > 0.2f
+                || beaconBuf.Count != lastBeaconKey;
+            if (changed)
+            {
+                lastPx = px; lastPz = pz; lastHeading = heading;
+                lastHasGame = hasGame; lastBiome = biome; lastBeaconKey = beaconBuf.Count;
+                Invalidate(MapArea());
+            }
+        }
+        beacons = beaconBuf;
+    }
+
+    // 按当前缩放档位预缩放图层到缓存位图(切层/跨档/改尺寸才重建一次)
+    private float FitScale(MapLayer L)
+    {
+        Rectangle r = MapArea();
+        float w = L.MaxX - L.MinX, h = L.MaxZ - L.MinZ;
+        if (w <= 0f || h <= 0f) return 0.1f;
+        return Math.Min(r.Width / w, r.Height / h);
+    }
+
+    private void EnsureCache(MapLayer L, Image img)
+    {
+        int bucket = zoom >= 8f ? 8 : (zoom >= 4f ? 4 : (zoom >= 2f ? 2 : 1));
+        Rectangle r = MapArea();
+        float fit = FitScale(L);
+        int cw = (int)Math.Min((L.MaxX - L.MinX) * fit * bucket + 1f, img.Width);
+        int ch = (int)Math.Min((L.MaxZ - L.MinZ) * fit * bucket + 1f, img.Height);
+        if (cw < 16) cw = 16;
+        if (ch < 16) ch = 16;
+        if (cacheBmp == null || cacheLayer != L || cacheBucket != bucket ||
+            cachePixelSize.Width != cw || cachePixelSize.Height != ch)
+        {
+            Bitmap nb = new Bitmap(cw, ch);
+            using (Graphics g = Graphics.FromImage(nb))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                g.DrawImage(img, new Rectangle(0, 0, cw, ch));
+            }
+            Bitmap oldBmp = cacheBmp;
+            cacheBmp = nb;
+            cacheLayer = L;
+            cacheBucket = bucket;
+            cachePixelSize = new Size(cw, ch);
+            if (oldBmp != null) oldBmp.Dispose();
+        }
+    }
+
+    private void ClampView()
+    {
+        MapLayer L = Layer();
+        if (L == null || !L.Calibrated) return;
+        Rectangle r = MapArea();
+        float s = FitScale(L) * zoom;
+        float halfW = r.Width / 2f / s, halfH = r.Height / 2f / s;
+        float w = L.MaxX - L.MinX, h = L.MaxZ - L.MinZ;
+        viewCX = w <= halfW * 2f ? (L.MinX + L.MaxX) / 2f
+            : Math.Max(L.MinX + halfW, Math.Min(L.MaxX - halfW, viewCX));
+        viewCZ = h <= halfH * 2f ? (L.MinZ + L.MaxZ) / 2f
+            : Math.Max(L.MinZ + halfH, Math.Min(L.MaxZ - halfH, viewCZ));
     }
 
     private void ShowNoActivate()
@@ -486,22 +569,35 @@ public class MapForm : Form
         return new Rectangle(0, 74, ClientSize.Width, ClientSize.Height - 74);
     }
 
-    private float ScaleAt(MapLayer L)
+    private readonly Pen beaconPen = new Pen(Color.FromArgb(200, 10, 10, 10), 2f);
+    private readonly Pen scalePen = new Pen(Color.White, 3f);
+    private readonly SolidBrush arrowFill = new SolidBrush(Color.FromArgb(235, 255, 70, 70));
+    private readonly Pen arrowPen = new Pen(Color.FromArgb(220, 10, 10, 10), 2f);
+    private readonly SolidBrush shadowBrush = new SolidBrush(Color.FromArgb(200, 0, 0, 0));
+    private readonly SolidBrush mapBgBrush = new SolidBrush(MapBg);
+
+    private SolidBrush PingBrush(int idx)
     {
-        return BaseScale(L);
+        int i = ((idx % PingColors.Length) + PingColors.Length) % PingColors.Length;
+        if (pingBrushes == null || pingBrushes.Length != PingColors.Length)
+        {
+            pingBrushes = new SolidBrush[PingColors.Length];
+            for (int k = 0; k < PingColors.Length; k++) pingBrushes[k] = new SolidBrush(PingColors[k]);
+        }
+        return pingBrushes[i];
     }
 
     private PointF WorldToScreen(MapLayer L, float wx, float wz)
     {
         Rectangle r = MapArea();
-        float s = ScaleAt(L);
+        float s = FitScale(L) * zoom;
         return new PointF(r.Width / 2f + (wx - viewCX) * s, r.Height / 2f + (wz - viewCZ) * s);
     }
 
     private PointF ScreenToWorldPt(MapLayer L, PointF sp)
     {
         Rectangle r = MapArea();
-        float s = ScaleAt(L);
+        float s = FitScale(L) * zoom;
         return new PointF(viewCX + (sp.X - r.Width / 2f) / s, viewCZ + (sp.Y - r.Height / 2f) / s);
     }
 
@@ -513,7 +609,7 @@ public class MapForm : Form
         g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
 
         Rectangle r = MapArea();
-        g.FillRectangle(new SolidBrush(MapBg), r);
+        g.FillRectangle(mapBgBrush, r);
 
         MapLayer L = Layer();
         if (L == null)
@@ -528,10 +624,19 @@ public class MapForm : Form
             return;
         }
 
-        float s = ScaleAt(L);
-        PointF tl = WorldToScreen(L, L.MinX, L.MinZ);
-        RectangleF dest = new RectangleF(tl.X, tl.Y, (L.MaxX - L.MinX) * s, (L.MaxZ - L.MinZ) * s);
-        g.DrawImage(img, dest);
+        EnsureCache(L, img);
+
+        // 从预缩放缓存位图上抠出当前视野(纯块拷贝, 不再每帧缩放原始大图)
+        g.InterpolationMode = InterpolationMode.Bilinear;
+        g.PixelOffsetMode = PixelOffsetMode.Half;
+        float cs = FitScale(L) * cacheBucket;
+        float vs = FitScale(L) * zoom;
+        RectangleF src = new RectangleF(
+            (viewCX - r.Width / 2f / vs - L.MinX) * cs,
+            (viewCZ - r.Height / 2f / vs - L.MinZ) * cs,
+            r.Width / vs * cs,
+            r.Height / vs * cs);
+        g.DrawImage(cacheBmp, r, src, GraphicsUnit.Pixel);
 
         if (L.Calibrated)
         {
@@ -539,10 +644,9 @@ public class MapForm : Form
             foreach (Beacon bk in beacons)
             {
                 PointF sp = WorldToScreen(L, bk.X, bk.Z);
-                if (!r.Contains(Point.Round(sp))) continue;
-                Color c = PingColors[((bk.Color % PingColors.Length) + PingColors.Length) % PingColors.Length];
-                g.FillEllipse(new SolidBrush(c), sp.X - 6f, sp.Y - 6f, 12f, 12f);
-                g.DrawEllipse(new Pen(Color.FromArgb(200, 10, 10, 10), 2f), sp.X - 6f, sp.Y - 6f, 12f, 12f);
+                if (sp.X < r.X - 40f || sp.Y < r.Y - 40f || sp.X > r.Right + 40f || sp.Y > r.Bottom + 40f) continue;
+                g.FillEllipse(PingBrush(bk.Color), sp.X - 6f, sp.Y - 6f, 12f, 12f);
+                g.DrawEllipse(beaconPen, sp.X - 6f, sp.Y - 6f, 12f, 12f);
                 if (!string.IsNullOrEmpty(bk.Label))
                 {
                     DrawShadowText(g, bk.Label, mapFont, sp.X + 9f, sp.Y - 10f);
@@ -553,27 +657,27 @@ public class MapForm : Form
             if (hasGame)
             {
                 PointF pp = WorldToScreen(L, px, pz);
-                var state = g.Save();
+                GraphicsState state = g.Save();
                 g.TranslateTransform(pp.X, pp.Y);
                 g.RotateTransform(heading);
                 PointF[] pts = new PointF[]
                 {
                     new PointF(0f, -13f), new PointF(9f, 11f), new PointF(0f, 6f), new PointF(-9f, 11f)
                 };
-                g.FillPolygon(new SolidBrush(Color.FromArgb(235, 255, 70, 70)), pts);
-                g.DrawPolygon(new Pen(Color.FromArgb(220, 10, 10, 10), 2f), pts);
+                g.FillPolygon(arrowFill, pts);
+                g.DrawPolygon(arrowPen, pts);
                 g.Restore(state);
             }
 
             // 比例尺
-            float mPerPx = (L.MaxX - L.MinX) / Math.Max(dest.Width, 1f);
+            float mPerPx = 1f / Math.Max(vs, 0.0001f);
             float barMeters = 200f;
-            float barPx = barMeters / Math.Max(mPerPx, 0.0001f);
+            float barPx = barMeters / mPerPx;
             while (barPx > 260f) { barPx /= 2f; barMeters /= 2f; }
             while (barPx < 60f) { barPx *= 2f; barMeters *= 2f; }
-            g.DrawLine(new Pen(Color.White, 3f), 16f, r.Bottom - 20f, 16f + barPx, r.Bottom - 20f);
-            g.DrawLine(new Pen(Color.White, 3f), 16f, r.Bottom - 24f, 16f, r.Bottom - 16f);
-            g.DrawLine(new Pen(Color.White, 3f), 16f + barPx, r.Bottom - 24f, 16f + barPx, r.Bottom - 16f);
+            g.DrawLine(scalePen, 16f, r.Bottom - 20f, 16f + barPx, r.Bottom - 20f);
+            g.DrawLine(scalePen, 16f, r.Bottom - 24f, 16f, r.Bottom - 16f);
+            g.DrawLine(scalePen, 16f + barPx, r.Bottom - 24f, 16f + barPx, r.Bottom - 16f);
             DrawShadowText(g, barMeters.ToString("0") + " m", smallFont, 20f + barPx, r.Bottom - 30f);
         }
         else
@@ -585,7 +689,7 @@ public class MapForm : Form
         {
             string msg = "等待游戏数据 — 请启动游戏并运行 SNInjector.exe 注入";
             SizeF sz = g.MeasureString(msg, mapFont);
-            g.FillRectangle(new SolidBrush(Color.FromArgb(160, 0, 0, 0)), r.Width / 2f - sz.Width / 2f - 10f, r.Top + 14f, sz.Width + 20f, sz.Height + 8f);
+            g.FillRectangle(shadowBrush, r.Width / 2f - sz.Width / 2f - 10f, r.Top + 14f, sz.Width + 20f, sz.Height + 8f);
             g.DrawString(msg, mapFont, Brushes.White, r.Width / 2f - sz.Width / 2f, r.Top + 18f);
         }
     }
@@ -609,7 +713,8 @@ public class MapForm : Form
         PointF after = ScreenToWorldPt(L, sp);
         viewCX += before.X - after.X;
         viewCZ += before.Y - after.Y;
-        Invalidate();
+        ClampView();
+        Invalidate(MapArea());
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
@@ -629,7 +734,7 @@ public class MapForm : Form
         {
             MapLayer L = Layer();
             if (L == null || !L.Calibrated) return;
-            float s = ScaleAt(L);
+            float s = FitScale(L) * zoom;
             viewCX -= (e.X - lastMouse.X) / s;
             viewCZ -= (e.Y - lastMouse.Y) / s;
             lastMouse = e.Location;
@@ -638,7 +743,8 @@ public class MapForm : Form
                 follow = false;
                 chkFollow.Checked = false;
             }
-            Invalidate();
+            ClampView();
+            Invalidate(MapArea());
         }
     }
 
