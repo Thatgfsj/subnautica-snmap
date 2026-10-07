@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.7";   // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X")
+        public const string Version = "2.7d";  // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X"); d=带一次性图标导出
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -48,6 +48,7 @@ namespace SNMap
         public static int MinimapPixels = 360;
         public static float[] MinimapSpans = new float[] { 200f, 300f, 500f, 1000f };
         public static List<TechType> CreatureWhitelist;   // null=显示全部攻击性生物
+        public static bool DumpIcons;                      // config.ini: 一次性把游戏图标导出成 icons/<TechType>.png
         public static string BaseDir = ".";
 
         public static void Init()
@@ -77,6 +78,8 @@ namespace SNMap
                 sb.AppendLine("#       ReaperLeviathan GhostLeviathan GhostLeviatanVoid SeaDragon");
                 sb.AppendLine("# 小型: Crash Biter Blighter CaveCrawler Mesmer LavaLizard LavaLarva Bleeder");
                 sb.AppendLine("CreatureWhitelist=BoneShark,Sandshark,Stalker,Crabsnake,CrabSquid,Warper,Shocker,ReaperLeviathan,GhostLeviathan,GhostLeviatanVoid,SeaDragon");
+                sb.AppendLine("# 一次性把游戏内图标导出到 icons 文件夹(1=开, 导出完自动停; 平时保持 0)");
+                sb.AppendLine("DumpIcons=0");
                 try { File.WriteAllText(path, sb.ToString()); } catch (Exception) { }
                 return;
             }
@@ -110,6 +113,12 @@ namespace SNMap
                                         fs.Add(f);
                                 }
                                 if (fs.Count > 0) MinimapSpans = fs.ToArray();
+                                break;
+                            }
+                        case "DumpIcons":
+                            {
+                                string dv = val.Trim();
+                                DumpIcons = dv == "1" || dv.ToLower() == "true";
                                 break;
                             }
                         case "CreatureWhitelist":
@@ -256,6 +265,7 @@ namespace SNMap
 
             frame++;
             ReadWindowSettings();
+            if (Cfg.DumpIcons && !dumpDone) DumpIconsTick();
             WriteState();
         }
 
@@ -417,6 +427,7 @@ namespace SNMap
                     WriteBeacons(pl, buf);
                 }
                 PutInt(buf, Proto.OffCreatureCount, creatureCount);
+                Buffer.BlockCopy(creatureRec, 0, buf, Proto.OffCreatures, creatureRec.Length);   // 每帧原样写回上次扫描结果
 
                 // 见过的敌对物种清单(设置窗口右侧"全部敌对生物"用), 每次写状态都带上,
                 // 否则 19/20 次写入会在 Array.Clear 之后变成空清单
@@ -543,6 +554,8 @@ namespace SNMap
             {
                 PutInt(buf, Proto.OffCreatureCount, 0);
                 creatureCount = 0;
+                creatureDrawPos.Clear();
+                creatureDrawKey.Clear();
                 return;
             }
             if (frame % 20 != 0 && lastCreatureFrame != 0 && frame - lastCreatureFrame < 20) return;
@@ -574,24 +587,30 @@ namespace SNMap
                 int cn = Mathf.Min(aggr.Count, Proto.MaxCreatures);
                 PutInt(buf, Proto.OffCreatureCount, cn);
                 creatureCount = cn;
+                creatureDrawPos.Clear();
+                creatureDrawKey.Clear();
+                for (int i = 0; i < Proto.MaxCreatures; i++) PutInt(creatureRec, i * 80 + 8, 0);   // 先清旧的标签长度
                 for (int i = 0; i < cn; i++)
                 {
                     Vector3 q = aggr[i].transform.position;
-                    int off = Proto.OffCreatures + i * 80;
-                    PutFloat(buf, off, q.x);
-                    PutFloat(buf, off + 4, q.z);
+                    int off = i * 80;
+                    PutFloat(creatureRec, off, q.x);
+                    PutFloat(creatureRec, off + 4, q.z);
                     string nm = CreatureName(aggr[i]);
                     byte[] nb = string.IsNullOrEmpty(nm) ? new byte[0] : Encoding.UTF8.GetBytes(nm);
                     if (nb.Length > 32) Array.Resize(ref nb, 32);
-                    PutInt(buf, off + 8, nb.Length);
-                    PutBytes(buf, off + 12, nb);
+                    PutInt(creatureRec, off + 8, nb.Length);
+                    PutBytes(creatureRec, off + 12, nb);
                     // 图标键 = TechType 名(对应内置的 icons/<key>.png), 大地图窗口拿它画生物头像
                     TechTag tgi = aggr[i].GetComponent<TechTag>();
                     string key = tgi != null ? tgi.type.ToString() : null;
                     byte[] kb = string.IsNullOrEmpty(key) ? new byte[0] : Encoding.UTF8.GetBytes(key);
                     if (kb.Length > 32) Array.Resize(ref kb, 32);
-                    PutInt(buf, off + 44, kb.Length);
-                    PutBytes(buf, off + 48, kb);
+                    PutInt(creatureRec, off + 44, kb.Length);
+                    PutBytes(creatureRec, off + 48, kb);
+                    // 小地图也要画, 这里留一份坐标+图标键
+                    creatureDrawPos.Add(q);
+                    creatureDrawKey.Add(key);
                 }
             }
             catch (Exception ex)
@@ -604,6 +623,12 @@ namespace SNMap
 
         private int creatureCount;
         private int lastCreatureFrame;
+        // 上一次扫描到的生物记录 + 给小地图用的坐标/图标键。
+        // 状态文件每帧都会 Array.Clear, 而生物只在每 20 帧扫一次 -> 必须持久保存每帧原样写回,
+        // 否则中间那些帧就是"数量>0、坐标全 0", 大地图上生物从真实位置跳到原点 = 一直闪烁。
+        private readonly byte[] creatureRec = new byte[Proto.MaxCreatures * 80];
+        private readonly List<Vector3> creatureDrawPos = new List<Vector3>();
+        private readonly List<string> creatureDrawKey = new List<string>();
 
         // 按设置窗口的勾选判断某物种是否显示:
         //   CreatureShow 键存在 -> 只显示列表里的(空 = 一个都不显示); "*" = 全部显示
@@ -719,6 +744,170 @@ namespace SNMap
             }
             string k;
             return labelToTech.TryGetValue(lbl, out k) ? k : null;
+        }
+
+        // ================= 一次性图标导出(config.ini: DumpIcons=1) =================
+        // 目的: 把游戏里的 UI 图标/生物头像导成 icons/<TechType>.png, 之后内置进发布包, 运行时就不用再抠图。
+        // 离线抽不到的(矿石类 UI 图标在图集里, 但图集贴图不跟着 bundle 走)就靠这里补齐。
+        // 每帧只处理几个, 避免主线程卡顿; 已存在的文件跳过(不覆盖离线抽到的那批正确图标)。
+        private int dumpIdx;
+        private bool dumpDone;
+        private int dumpWrote, dumpSkip, dumpFail, dumpNoSprite, dumpNoTex;
+        private static string lastDumpErr;
+        private static MethodInfo pdascanGet, pdaencyGet;
+
+        private void DumpIconsTick()
+        {
+            if (dumpDone) return;
+            try
+            {
+                Array vals = Enum.GetValues(typeof(TechType));
+                if (dumpIdx == 0)
+                {
+                    Cfg.Log("icon dump: start, TechType=" + vals.Length +
+                            " spriteManager=" + (SpriteManager.hasInitialized ? "ready" : "not-ready"));
+                    try
+                    {
+                        string d = Path.Combine(Cfg.BaseDir, "icons");
+                        if (!Directory.Exists(d)) Directory.CreateDirectory(d);
+                    }
+                    catch (Exception) { }
+                }
+                if (!SpriteManager.hasInitialized && dumpIdx > 0) return;
+
+                int burst = 0;
+                while (dumpIdx < vals.Length && burst < 3)
+                {
+                    TechType tt = (TechType)vals.GetValue(dumpIdx);
+                    dumpIdx++;
+                    burst++;
+                    string name = tt.ToString();
+                    if (name == "None") continue;
+                    string path = Path.Combine(Cfg.BaseDir, Path.Combine("icons", name + ".png"));
+                    if (File.Exists(path)) { dumpSkip++; continue; }
+                    Sprite sp = IconSprite(tt);
+                    if (sp == null) { dumpFail++; dumpNoSprite++; continue; }
+                    Texture2D tex = SpriteToReadable(sp);
+                    if (tex == null) { dumpFail++; dumpNoTex++; continue; }
+                    try
+                    {
+                        byte[] png = tex.EncodeToPNG();
+                        if (png != null && png.Length > 0) { File.WriteAllBytes(path, png); dumpWrote++; }
+                        else dumpFail++;
+                    }
+                    catch (Exception) { dumpFail++; }
+                    finally { UnityEngine.Object.Destroy(tex); }
+                }
+
+                if (dumpIdx >= vals.Length)
+                {
+                    dumpDone = true;
+                    Cfg.Log("icon dump: done wrote=" + dumpWrote + " skipped=" + dumpSkip + " failed=" + dumpFail +
+                            " (无sprite=" + dumpNoSprite + " 有sprite但取不到纹理=" + dumpNoTex + ")" +
+                            " lastErr=" + lastDumpErr);
+                }
+            }
+            catch (Exception ex)
+            {
+                dumpDone = true;
+                Cfg.Log("icon dump failed: " + ex.Message);
+            }
+        }
+
+        // 优先用图鉴头像(生物), 没有就走 SpriteManager(物品/工具/植物)
+        private Sprite IconSprite(TechType tt)
+        {
+            Sprite s = EncyclopediaSprite(tt);
+            if (s != null) return s;
+            try
+            {
+                if (!SpriteManager.hasInitialized) return null;
+                Sprite it = SpriteManager.Get(tt);
+                if (it != null && it != SpriteManager.defaultSprite) return it;
+            }
+            catch (Exception) { }
+            return null;
+        }
+
+        // PDAScanner.GetEntryData(tt).encyclopedia -> PDAEncyclopedia.GetEntryData(key).popup
+        // (两个 EntryData 都是 internal, 所以走反射)
+        private Sprite EncyclopediaSprite(TechType tt)
+        {
+            try
+            {
+                if (pdascanGet == null)
+                {
+                    pdascanGet = typeof(PDAScanner).GetMethod("GetEntryData");
+                    pdaencyGet = typeof(PDAEncyclopedia).GetMethod("GetEntryData");
+                }
+                if (pdascanGet == null || pdaencyGet == null) return null;
+                object scan = pdascanGet.Invoke(null, new object[] { tt });
+                if (scan == null) return null;
+                FieldInfo f = scan.GetType().GetField("encyclopedia");
+                if (f == null) return null;
+                string key = (string)f.GetValue(scan);
+                if (string.IsNullOrEmpty(key)) return null;
+                object[] args = new object[] { key, null };
+                object ok = pdaencyGet.Invoke(null, args);
+                if (!(ok is bool) || !(bool)ok || args[1] == null) return null;
+                FieldInfo pf = args[1].GetType().GetField("popup");
+                if (pf == null) return null;
+                return pf.GetValue(args[1]) as Sprite;
+            }
+            catch (Exception) { return null; }
+        }
+
+        // Sprite -> 可读 Texture2D: 图集纹理通常不可读, 用 RenderTexture 抠子矩形 + 读回 + 上下翻转。
+        // 注意: 不要用 sprite.uv(非打包 sprite 可能是空数组, 会 IndexOutOfRange -> 全军覆没),
+        // 直接用 textureRect(像素, 原点左下) 自己算 UV。
+        private static Texture2D SpriteToReadable(Sprite sp)
+        {
+            if (sp == null) return null;
+            Texture2D src = null;
+            try { src = sp.texture; } catch (Exception) { }
+            if (src == null) { lastDumpErr = "no texture"; return null; }
+            Rect tr;
+            try { tr = sp.textureRect; } catch (Exception e) { lastDumpErr = "textureRect: " + e.Message; return null; }
+            int w = Mathf.RoundToInt(tr.width), h = Mathf.RoundToInt(tr.height);
+            if (w <= 0 || h <= 0) { lastDumpErr = "size " + w + "x" + h; return null; }
+            if (w > 512 || h > 512) { lastDumpErr = "too big " + w + "x" + h; return null; }
+            // 可读纹理直接抠(最快路径)
+            if (src.isReadable)
+            {
+                try
+                {
+                    Color[] px = src.GetPixels(Mathf.RoundToInt(tr.x), Mathf.RoundToInt(tr.y), w, h);
+                    Texture2D t0 = new Texture2D(w, h, TextureFormat.RGBA32, false);
+                    t0.SetPixels(px);
+                    t0.Apply();
+                    return t0;
+                }
+                catch (Exception e) { lastDumpErr = "readable path: " + e.Message; }
+            }
+            RenderTexture rt = null;
+            RenderTexture prev = RenderTexture.active;
+            try
+            {
+                rt = RenderTexture.GetTemporary(w, h, 0);
+                float tw = src.width, th = src.height;
+                Graphics.Blit(src, rt, new Vector2(tr.width / tw, tr.height / th), new Vector2(tr.x / tw, tr.y / th));
+                RenderTexture.active = rt;
+                Texture2D t = new Texture2D(w, h, TextureFormat.RGBA32, false);
+                t.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+                t.Apply();
+                Color32[] px = t.GetPixels32();
+                Color32[] flip = new Color32[px.Length];
+                for (int y = 0; y < h; y++) Array.Copy(px, y * w, flip, (h - 1 - y) * w, w);
+                t.SetPixels32(flip);
+                t.Apply();
+                return t;
+            }
+            catch (Exception e) { lastDumpErr = "blit path: " + e.Message; return null; }
+            finally
+            {
+                RenderTexture.active = prev;
+                if (rt != null) RenderTexture.ReleaseTemporary(rt);
+            }
         }
 
         // 内置图标(icons/<TechType>.png)按需加载 + 缓存; 缺图标就返回 null, 调用方退回原来的点/三角
@@ -1067,6 +1256,28 @@ namespace SNMap
                 {
                     GUI.color = new Color(1f, 0.85f, 0.2f);
                     GUI.DrawTexture(new Rect(nx - 4f, ny - 4f, 8f, 8f), dotTex);
+                    GUI.color = Color.white;
+                }
+            }
+
+            // 敌对生物: 小地图也画(有内置头像就画头像, 没有画红点)
+            for (int i = 0; i < creatureDrawPos.Count; i++)
+            {
+                Vector3 q = creatureDrawPos[i];
+                if (q.x < winX0 || q.x > winX0 + spanWorld || q.z < winZ0 || q.z > winZ0 + spanWorld) continue;
+                float mx = sq.x + (q.x - winX0) / spanWorld * D;
+                float my = sq.y + (1f - (q.z - winZ0) / spanWorld) * D;
+                if (Vector2.Distance(new Vector2(mx, my), sq.center) > D * 0.5f - 12f) continue;
+                Texture2D cico = GetIconTex(creatureDrawKey[i]);
+                if (cico != null)
+                {
+                    GUI.color = Color.white;
+                    GUI.DrawTexture(new Rect(mx - 9f, my - 9f, 18f, 18f), cico);
+                }
+                else
+                {
+                    GUI.color = new Color(1f, 0.25f, 0.25f);
+                    GUI.DrawTexture(new Rect(mx - 4f, my - 4f, 8f, 8f), dotTex);
                     GUI.color = Color.white;
                 }
             }
