@@ -716,9 +716,10 @@ public class MapForm : Form
             if (!File.Exists(sp)) throw new Exception();
             if (stateReadBuf == null) stateReadBuf = new byte[Proto.StateSize];
             byte[] buf = stateReadBuf;
-            // 显式 FileShare.ReadWrite: File.ReadAllBytes 用的是 FileShare.Read, 会把模块那头的
-            // 20Hz 写入挡掉(写失败就丢帧, 表现还是"不刷新")
-            using (FileStream fs = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            // FileShare.ReadWrite: File.ReadAllBytes 用的是 FileShare.Read, 会把模块那头的写入挡掉。
+            // 必须再加 FileShare.Delete: 模块改成"先写临时文件再原子替换"后, 替换需要能重命名这个文件,
+            // 不给 Delete 共享的话替换会一直失败(退回就地覆盖 -> 又会出现撕裂读导致的生物抖动)。
+            using (FileStream fs = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
             {
                 int total = (int)Math.Min(fs.Length, buf.Length);
                 int got = 0;

@@ -428,7 +428,16 @@ namespace SNMap
                     WriteBeacons(pl, buf);
                 }
                 PutInt(buf, Proto.OffCreatureCount, creatureCount);
-                Buffer.BlockCopy(creatureRec, 0, buf, Proto.OffCreatures, creatureRec.Length);   // 每帧原样写回上次扫描结果
+                // 位置每帧实时刷新(生物引用是 1 秒前扫出来的集合, 但坐标必须跟手, 否则标记会一顿一顿地跳)
+                for (int i = 0; i < trackedCreatures.Count; i++)
+                {
+                    Creature c = trackedCreatures[i];
+                    if (c == null) continue;
+                    Vector3 cq = c.transform.position;
+                    PutFloat(creatureRec, i * 80, cq.x);
+                    PutFloat(creatureRec, i * 80 + 4, cq.z);
+                }
+                Buffer.BlockCopy(creatureRec, 0, buf, Proto.OffCreatures, creatureRec.Length);   // 每帧原样写回
 
                 // 见过的敌对物种清单(设置窗口右侧"全部敌对生物"用), 每次写状态都带上,
                 // 否则 19/20 次写入会在 Array.Clear 之后变成空清单
@@ -444,14 +453,39 @@ namespace SNMap
                 }
 
                 string sp = Path.Combine(Cfg.BaseDir, Proto.StateFileName);
-                // 就地覆盖, 不截断: 窗口每 33ms 读一次, 用 FileMode.Create 会先把文件截成 0 字节,
-                // 读的那一头就会拿到半截文件 -> 生物"忽有忽无/坐标乱跳"。文件长度保持恒定后,
-                // 撕裂读到的也只是相邻两帧的数据, 无害。
-                using (FileStream fs = new FileStream(sp, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite))
+                string tmp = sp + ".tmp";
+                // 先写临时文件再原子替换: 窗口每 33ms 读一次, 如果原地覆写, 它会读到"写了一半"的内容
+                // (玩家坐标在最前面、生物记录在最后 -> 只有生物在相邻两帧之间来回跳 = 一直抖动)。
+                // 替换要求读的那头以 FileShare.Delete 打开(窗口已配合), 失败则退回就地覆盖保证还能更新。
+                bool wrote = false;
+                for (int attempt = 0; attempt < 3 && !wrote; attempt++)
                 {
-                    if (fs.Length != buf.Length) fs.SetLength(buf.Length);
-                    fs.Position = 0;
-                    fs.Write(buf, 0, buf.Length);
+                    try
+                    {
+                        using (FileStream fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+                        {
+                            fs.Write(buf, 0, buf.Length);
+                            fs.Flush();
+                        }
+                        if (File.Exists(sp)) File.Replace(tmp, sp, null);
+                        else File.Move(tmp, sp);
+                        wrote = true;
+                    }
+                    catch (Exception)
+                    {
+                        if (attempt < 2) continue;
+                        try
+                        {
+                            using (FileStream fs = new FileStream(sp, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite))
+                            {
+                                if (fs.Length != buf.Length) fs.SetLength(buf.Length);
+                                fs.Position = 0;
+                                fs.Write(buf, 0, buf.Length);
+                            }
+                            wrote = true;
+                        }
+                        catch (Exception) { }
+                    }
                 }
             }
             catch (Exception ex)
@@ -555,8 +589,8 @@ namespace SNMap
             {
                 PutInt(buf, Proto.OffCreatureCount, 0);
                 creatureCount = 0;
-                creatureDrawPos.Clear();
-                creatureDrawKey.Clear();
+                trackedCreatures.Clear();
+                trackedKeys.Clear();
                 return;
             }
             if (frame % 20 != 0 && lastCreatureFrame != 0 && frame - lastCreatureFrame < 20) return;
@@ -588,8 +622,8 @@ namespace SNMap
                 int cn = Mathf.Min(aggr.Count, Proto.MaxCreatures);
                 PutInt(buf, Proto.OffCreatureCount, cn);
                 creatureCount = cn;
-                creatureDrawPos.Clear();
-                creatureDrawKey.Clear();
+                trackedCreatures.Clear();
+                trackedKeys.Clear();
                 for (int i = 0; i < Proto.MaxCreatures; i++) PutInt(creatureRec, i * 80 + 8, 0);   // 先清旧的标签长度
                 for (int i = 0; i < cn; i++)
                 {
@@ -609,9 +643,9 @@ namespace SNMap
                     if (kb.Length > 32) Array.Resize(ref kb, 32);
                     PutInt(creatureRec, off + 44, kb.Length);
                     PutBytes(creatureRec, off + 48, kb);
-                    // 小地图也要画, 这里留一份坐标+图标键
-                    creatureDrawPos.Add(q);
-                    creatureDrawKey.Add(key);
+                    // 小地图/大地图绘制用: 保留生物引用, 位置每帧实时取(见 WriteState 里的刷新)
+                    trackedCreatures.Add(aggr[i]);
+                    trackedKeys.Add(key);
                 }
             }
             catch (Exception ex)
@@ -624,12 +658,13 @@ namespace SNMap
 
         private int creatureCount;
         private int lastCreatureFrame;
-        // 上一次扫描到的生物记录 + 给小地图用的坐标/图标键。
-        // 状态文件每帧都会 Array.Clear, 而生物只在每 20 帧扫一次 -> 必须持久保存每帧原样写回,
-        // 否则中间那些帧就是"数量>0、坐标全 0", 大地图上生物从真实位置跳到原点 = 一直闪烁。
+        // 上一次扫描到的生物记录 + 给绘制用的生物引用。
+        // 状态文件每帧都会 Array.Clear, 而"有哪些生物"只在每 60 帧(≈1秒)扫一次 ->
+        // 记录要持久保存每帧原样写回; 而且位置必须每帧从 transform 实时取,
+        // 否则地图在平滑滚动、标记却 1 秒才动一次, 看起来就是"标记一直在抖"。
         private readonly byte[] creatureRec = new byte[Proto.MaxCreatures * 80];
-        private readonly List<Vector3> creatureDrawPos = new List<Vector3>();
-        private readonly List<string> creatureDrawKey = new List<string>();
+        private readonly List<Creature> trackedCreatures = new List<Creature>();
+        private readonly List<string> trackedKeys = new List<string>();
 
         // 按设置窗口的勾选判断某物种是否显示:
         //   CreatureShow 键存在 -> 只显示列表里的(空 = 一个都不显示); "*" = 全部显示
@@ -718,17 +753,20 @@ namespace SNMap
                 }
                 if (getNodesM == null || riType == null || scanNodePos.Count >= 48) return;
 
-                // 逐类型取"全世界该类型的节点", 距离过滤自己做(房间范围 + 玩家 600m 双重限制)
+                // 逐类型取"全世界该类型的节点", 距离过滤自己做(房间范围 + 玩家 800m 双重限制)。
+                // 每个类型限额, 否则第一个类型(比如石灰岩)会把 48 个位子全占掉, 你选的那个物品一个都轮不上。
                 float lim = range + 60f;
+                int perType = Mathf.Clamp(48 / Mathf.Max(1, types.Count), 4, 24);
                 for (int t = 0; t < types.Count && scanNodePos.Count < 48; t++)
                 {
                     System.Collections.IEnumerable all = null;
                     try { all = getNodesM.Invoke(null, new object[] { types[t] }) as System.Collections.IEnumerable; }
                     catch (Exception ex) { if (scanErrLogged < 3) { scanErrLogged++; Cfg.Log("GetNodes invoke fail: " + ex.Message); } }
                     if (all == null) continue;
+                    int takenThisType = 0;
                     foreach (object info in all)
                     {
-                        if (info == null || scanNodePos.Count >= 48) break;
+                        if (info == null || scanNodePos.Count >= 48 || takenThisType >= perType) break;
                         scanRawTotal++;
                         TechType tt = (TechType)riTechF.GetValue(info);
                         Vector3 pos = (Vector3)riPosF.GetValue(info);
@@ -739,6 +777,7 @@ namespace SNMap
                         string cn = null;
                         try { cn = Language.main.Get(tt.AsString()); } catch (Exception) { }
                         scanNodeName.Add(string.IsNullOrEmpty(cn) ? tt.ToString() : cn);
+                        takenThisType++;
                     }
                 }
                 if (frame % 300 == 0)
@@ -1291,15 +1330,17 @@ namespace SNMap
                 }
             }
 
-            // 敌对生物: 小地图也画(有内置头像就画头像, 没有画红点)
-            for (int i = 0; i < creatureDrawPos.Count; i++)
+            // 敌对生物: 小地图也画(有内置头像就画头像, 没有画黑描边红感叹号); 坐标每帧实时取
+            for (int i = 0; i < trackedCreatures.Count; i++)
             {
-                Vector3 q = creatureDrawPos[i];
+                Creature c = trackedCreatures[i];
+                if (c == null) continue;
+                Vector3 q = c.transform.position;
                 if (q.x < winX0 || q.x > winX0 + spanWorld || q.z < winZ0 || q.z > winZ0 + spanWorld) continue;
                 float mx = sq.x + (q.x - winX0) / spanWorld * D;
                 float my = sq.y + (1f - (q.z - winZ0) / spanWorld) * D;
                 if (Vector2.Distance(new Vector2(mx, my), sq.center) > D * 0.5f - 12f) continue;
-                Texture2D cico = GetIconTex(creatureDrawKey[i]);
+                Texture2D cico = GetIconTex(i < trackedKeys.Count ? trackedKeys[i] : null);
                 if (cico != null)
                 {
                     GUI.color = Color.white;
