@@ -231,6 +231,9 @@ public class MapForm : Form
         t.Interval = 33;
         t.Tick += delegate { Tick(); };
         t.Start();
+
+        // 手动双击启动 = 玩家想立刻看图: 写回 ShowWindow=1, 避免被旧设置首拍藏掉(--auto 待命不写)
+        if (!Program.AutoStart) WriteSettingsKey("ShowWindow", "1");
     }
 
     private Button BlueBtn(string text, int x, int y, int w, int h)
