@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.3";   // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X")
+        public const string Version = "2.4";   // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X")
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -382,8 +382,13 @@ namespace SNMap
                 PutInt(buf, Proto.OffCreatureCount, creatureCount);
 
                 string sp = Path.Combine(Cfg.BaseDir, Proto.StateFileName);
-                using (FileStream fs = new FileStream(sp, FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
+                // 就地覆盖, 不截断: 窗口每 33ms 读一次, 用 FileMode.Create 会先把文件截成 0 字节,
+                // 读的那一头就会拿到半截文件 -> 生物"忽有忽无/坐标乱跳"。文件长度保持恒定后,
+                // 撕裂读到的也只是相邻两帧的数据, 无害。
+                using (FileStream fs = new FileStream(sp, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite))
                 {
+                    if (fs.Length != buf.Length) fs.SetLength(buf.Length);
+                    fs.Position = 0;
                     fs.Write(buf, 0, buf.Length);
                 }
             }
@@ -448,14 +453,15 @@ namespace SNMap
                 PutBytes(buf, off + 20, b);
             }
 
-            // 攻击性生物(每 60 帧=1秒 扫一次, 取最近 24 只, 600m 内)
+            // 攻击性生物(每 20 帧≈0.33秒 扫一次, 取最近 24 只, 600m 内)
+            // 原来 60 帧(1秒)一次, 生物位置最多滞后 1 秒, 看起来就是"不刷新"
             if (!showCreatures)
             {
                 PutInt(buf, Proto.OffCreatureCount, 0);
                 creatureCount = 0;
                 return;
             }
-            if (frame % 60 != 0 && lastCreatureFrame != 0 && frame - lastCreatureFrame < 60) return;
+            if (frame % 20 != 0 && lastCreatureFrame != 0 && frame - lastCreatureFrame < 20) return;
             lastCreatureFrame = frame;
             try
             {

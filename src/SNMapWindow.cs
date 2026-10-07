@@ -149,6 +149,13 @@ public class MapForm : Form
         btnNext = BlueBtn("＋", 306, 8, 40, 30);
         btnExit = BlueBtn("退出", ClientSize.Width - 78, 8, 70, 30);
         btnExit.Anchor = AnchorStyles.Top | AnchorStyles.Right;   // 最大化后仍贴右上角
+        // 原先只创建了按钮, 忘了挂 Click, 所以点了没反应
+        btnExit.Click += delegate
+        {
+            exiting = true;                          // 让 FormClosing 不再拦截
+            WriteSettingsKey("ShowWindow", "0");     // 与模块内的显示状态保持一致
+            Close();
+        };
         lblLayer = new Label();
         lblLayer.Location = new Point(56, 13);
         lblLayer.Size = new Size(242, 24);
@@ -240,8 +247,10 @@ public class MapForm : Form
         t.Tick += delegate { Tick(); };
         t.Start();
 
-        // 手动双击启动 = 玩家想立刻看图: 写回 ShowWindow=1, 避免被旧设置首拍藏掉(--auto 待命不写)
-        if (!Program.AutoStart) WriteSettingsKey("ShowWindow", "1");
+        // --auto(引导层注入后拉起) = 待命隐藏, F9 才显示: 必须主动写回 0,
+        // 否则会被上次遗留的 ShowWindow=1 顶成"注入就弹图"(用户 21:25 遇到的就是这种)
+        // 手动双击启动 = 玩家想立刻看图: 写回 1
+        WriteSettingsKey("ShowWindow", Program.AutoStart ? "0" : "1");
     }
 
     private Button BlueBtn(string text, int x, int y, int w, int h)
@@ -463,18 +472,22 @@ public class MapForm : Form
 
         if (Visible)
         {
+            // 注意: 旧代码只比较"数量"(beacons.Count / creatureWin.Count), 于是只要
+            // 生物数量没变(比如同样 3 只在游动), 状态一直在变也永远不重绘 -> 红三角看着是钉死的。
+            // 现在用坐标签名, 生物一动就重绘。
+            int bSig = BeaconSig(), cSig = CreatureSig();
             bool changed = hasGame != lastHasGame
                 || biome != lastBiome
                 || Math.Abs(px - lastPx) > 0.01f
                 || Math.Abs(pz - lastPz) > 0.01f
                 || Math.Abs(heading - lastHeading) > 0.2f
-                || beacons.Count != lastBeaconKey
-                || creatureWin.Count != lastCreatureKey;
+                || bSig != lastBeaconKey
+                || cSig != lastCreatureKey;
             if (changed)
             {
                 lastPx = px; lastPz = pz; lastHeading = heading;
                 lastHasGame = hasGame; lastBiome = biome;
-                lastBeaconKey = beacons.Count; lastCreatureKey = creatureWin.Count;
+                lastBeaconKey = bSig; lastCreatureKey = cSig;
                 Invalidate(MapArea());
             }
         }
@@ -489,7 +502,21 @@ public class MapForm : Form
         {
             string sp = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, Proto.StateFileName);
             if (!File.Exists(sp)) throw new Exception();
-            byte[] buf = File.ReadAllBytes(sp);
+            byte[] buf;
+            // 显式 FileShare.ReadWrite: File.ReadAllBytes 用的是 FileShare.Read, 会把模块那头的
+            // 20Hz 写入挡掉(写失败就丢帧, 表现还是"不刷新")
+            using (FileStream fs = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                buf = new byte[fs.Length];
+                int got = 0;
+                while (got < buf.Length)
+                {
+                    int r = fs.Read(buf, got, buf.Length - got);
+                    if (r <= 0) break;
+                    got += r;
+                }
+                if (got != buf.Length) throw new Exception();
+            }
             if (buf.Length < 128 || GetInt(buf, OffMagic) != Magic) throw new Exception();
             int ver = GetInt(buf, OffVersion);
             if (ver != ProtoVersion)
@@ -569,10 +596,25 @@ public class MapForm : Form
         catch (Exception) { }
     }
 
+    // --auto(注入后由引导层拉起)时保持隐藏待命: 拦掉 Application.Run 的首次显示,
+    // 否则会先把最大化的窗口闪一下再被轮询藏掉。F9 要显示时走 ShowToFront() 放行。
+    private bool allowShow;
+
+    protected override void SetVisibleCore(bool value)
+    {
+        if (value && !allowShow && Program.AutoStart)
+        {
+            base.SetVisibleCore(false);
+            return;
+        }
+        base.SetVisibleCore(value);
+    }
+
     // F9 显示: 必须真的抬到最前。原来只调 SW_SHOWNA(只显示不抬升), 会被游戏窗口压在后面。
     // 关键取舍: 用 SWP_NOACTIVATE 抬升但不抢焦点 —— 一旦抢了游戏的键盘焦点, 游戏就收不到下一次 F9, 反而关不掉地图。
     private void ShowToFront()
     {
+        allowShow = true;
         Show();
         if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Maximized;
         TopMost = chkTop.Checked;   // 让"置顶"勾选真正生效(默认勾选)
@@ -780,6 +822,29 @@ public class MapForm : Form
             g.FillRectangle(shadowBrush, r.Width / 2f - sz.Width / 2f - 10f, r.Top + 14f, sz.Width + 20f, sz.Height + 8f);
             g.DrawString(msg, mapFont, Brushes.White, r.Width / 2f - sz.Width / 2f, r.Top + 18f);
         }
+    }
+
+    // 位置签名(0.125m 量化), 用来判断"这份数据变了没有、要不要重绘"
+    private int BeaconSig()
+    {
+        int h = beacons.Count * 397;
+        for (int i = 0; i < beacons.Count; i++)
+        {
+            Beacon b = beacons[i];
+            h = h * 31 + (int)(b.X * 8f) * 7 + (int)(b.Z * 8f) * 13 + b.Color;
+        }
+        return h;
+    }
+
+    private int CreatureSig()
+    {
+        int h = creatureWin.Count * 397;
+        for (int i = 0; i < creatureWin.Count; i++)
+        {
+            CreaturePt c = creatureWin[i];
+            h = h * 31 + (int)(c.X * 8f) * 7 + (int)(c.Z * 8f) * 13;
+        }
+        return h;
     }
 
     private SolidBrush PingBrush(int idx)

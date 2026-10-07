@@ -150,42 +150,6 @@ static void do_install(void)
     LaunchMapWindow();
 }
 
-/* 若地图窗口未运行则启动它(与本 dll 同目录的 SNMapWindow.exe) */
-static void LaunchMapWindow(void)
-{
-    wchar_t dir[MAX_PATH];
-    wchar_t exe[MAX_PATH];
-    wchar_t cmd[MAX_PATH];
-    DWORD n = GetModuleFileNameW(g_self, dir, MAX_PATH);
-    if (!n || n >= MAX_PATH) return;
-    while (n > 0 && dir[n - 1] != L'\\') n--;
-    if (n == 0) return;
-    dir[n] = 0;
-    lstrcpyW(exe, dir);
-    lstrcpyW(exe + n, L"SNMapWindow.exe");
-    if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) return;
-
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32W pe;
-        pe.dwSize = sizeof(pe);
-        if (Process32FirstW(snap, &pe)) {
-            do {
-                if (lstrcmpiW(pe.szExeFile, L"SNMapWindow.exe") == 0) {
-                    CloseHandle(snap);
-                    dlog("map window already running");
-                    return;
-                }
-            } while (Process32NextW(snap, &pe));
-        }
-        CloseHandle(snap);
-    }
-
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    ZeroMemory(&pi, sizeof(pi));
 /* 若地图窗口未运行则启动它(加 --auto: 注入后待命隐藏, F9 才显示) */
 static void LaunchMapWindow(void)
 {
