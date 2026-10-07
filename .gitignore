@@ -1,0 +1,12 @@
+# build outputs
+*.dll
+*.exe
+*.log
+*.zip
+.mimosa/
+
+# user-specific
+config.ini
+map.png
+使用说明.txt
+SNAppData/
