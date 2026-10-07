@@ -1,6 +1,7 @@
-// SNMapWindow - 深海迷航独立大地图窗口 (解压即用, 配合注入模块通过共享内存通信)
-// 数据: 游戏内注入模块写入共享内存 SNMapState_1 (玩家/朝向/信标/生物群系/F9标志)
-// 交互: 滚轮缩放(原生事件) / 左键拖拽平移 / [－][＋]切换图层 / 跟随 / 置顶 / F9 显示隐藏
+// SNMapWindow - 深海迷航独立大地图窗口 v2.0
+// 数据: 轮询游戏模块写的 SNMapState.bin (20Hz); 设置通过 SNMapSettings.ini 双向交换
+// 渲染: mip 金字塔预缩放(参考 Xaero 式预合成), 每帧只做块拷贝
+// 交互: 滚轮缩放 / 左键拖拽 / [－][＋]切换图层 / 跟随玩家 / 置顶 / F9 显示隐藏(由模块写标志)
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -9,21 +10,27 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
-using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
+using SNMap;
 
 static class Program
 {
+    public static bool AutoStart;   // --auto: 由注入流程拉起, 初始隐藏待命(F9 显示)
+
     [STAThread]
     static void Main()
     {
-        // 单实例: 自动清掉多余的旧窗口进程(之前版本可能堆积多个)
+        // 单实例: 自动清掉多余的旧窗口进程
         Process cur = Process.GetCurrentProcess();
         foreach (Process p in Process.GetProcessesByName("SNMapWindow"))
         {
             if (p.Id != cur.Id) { try { p.Kill(); } catch (Exception) { } }
+        }
+        foreach (string a in Environment.GetCommandLineArgs())
+        {
+            if (a == "--auto") AutoStart = true;
         }
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
@@ -38,7 +45,14 @@ internal class MapLayer
     public float MinX = -2000f, MaxX = 2000f, MinZ = -2000f, MaxZ = 2000f;
     public bool Calibrated = true;
     public Image[] Mips;        // 预缩放金字塔(由大到小), 载入后释放原图
-    public float[] MipPxPerM;   // 每级: 像素/米
+    public float[] MipPxPerM;
+}
+
+internal class Beacon
+{
+    public float X, Z;
+    public int Color;
+    public string Label;
 }
 
 internal class CreaturePt
@@ -49,11 +63,13 @@ internal class CreaturePt
 
 public class MapForm : Form
 {
-    private const string MmfName = "SNMapState_1";
+    private const int OffMagic = 0, OffVersion = 4, OffTick = 8;
     private const int OffPlayerValid = 16, OffX = 20, OffY = 24, OffZ = 28, OffHeading = 32;
-    private const int OffShowWindow = 36, OffBeaconCount = 40, OffBiomeLen = 44, OffBiome = 48;
-    private const int OffBeacons = 128, OffWindowLayer = 4224, OffWorldRange = 4228;
-    private const int OffMinimapPixels = 4232, OffShowCreatures = 4236, OffCreatureCount = 4240, OffCreatures = 4248;
+    private const int OffShowWindow = 36, OffModVerLen = 40, OffModVer = 44;
+    private const int OffBeaconCount = 80, OffBiomeLen = 84, OffBiome = 88;
+    private const int OffBeacons = 128;
+    private const int OffCreatureCount = 4268, OffCreatures = 4272;
+    private const int Magic = 0x534E4D50, ProtoVersion = 2;
 
     private static readonly Color ThemeBg = Color.FromArgb(232, 241, 252);
     private static readonly Color ThemeAccent = Color.FromArgb(25, 118, 210);
@@ -72,33 +88,34 @@ public class MapForm : Form
     private bool hasGame;
     private float px, py, pz, heading;
     private string biome = "";
+    private string modVer = "?";
     private List<Beacon> beacons = new List<Beacon>();
     private readonly List<CreaturePt> creatureWin = new List<CreaturePt>();
-    private readonly SolidBrush creatureBrush = new SolidBrush(Color.FromArgb(225, 255, 40, 40));
-    private MemoryMappedFile mmf;
-    private MemoryMappedViewAccessor acc;
-    // mip 金字塔缓存见 MapLayer.Mips
-    private bool mmfTried;
-    private bool lastShowFlag;
-    private bool firstTick = true;
-
-    // 图层纹理采用 mip 金字塔缓存(见 MapLayer.Mips)
+    private DateTime settingsStamp;
+    private int noStateTicks;
+    private int tickCount;
+    private bool exiting;
 
     // 脏检查: 状态没变化就不重绘
     private float lastPx = float.MinValue, lastPz = float.MinValue, lastHeading = float.MinValue;
-    private int lastBeaconKey = -1;
+    private int lastBeaconKey = -1, lastCreatureKey = -1;
     private bool lastHasGame;
     private string lastBiome = "";
-    private readonly List<Beacon> beaconBuf = new List<Beacon>();
-    private float worldRange = 2000f;
-    private bool exiting;
 
-    private Button btnPrev, btnNext, btnExit;
+    private Button btnPrev, btnNext, btnExit, btnApply;
     private CheckBox chkFollow, chkTop, chkCreatures;
     private TextBox txtMini;
-    private Button btnApply;
     private Label lblLayer, lblInfo;
     private Font mapFont, smallFont;
+
+    private readonly Pen beaconPen = new Pen(Color.FromArgb(200, 10, 10, 10), 2f);
+    private readonly Pen scalePen = new Pen(Color.White, 3f);
+    private readonly SolidBrush arrowFill = new SolidBrush(Color.FromArgb(235, 255, 70, 70));
+    private readonly Pen arrowPen = new Pen(Color.FromArgb(220, 10, 10, 10), 2f);
+    private readonly SolidBrush shadowBrush = new SolidBrush(Color.FromArgb(200, 0, 0, 0));
+    private readonly SolidBrush mapBgBrush = new SolidBrush(MapBg);
+    private readonly SolidBrush creatureBrush = new SolidBrush(Color.FromArgb(225, 255, 40, 40));
+    private SolidBrush[] pingBrushes;
 
     private static readonly Color[] PingColors = new Color[]
     {
@@ -113,13 +130,6 @@ public class MapForm : Form
         "N 北", "NE 东北", "E 东", "SE 东南", "S 南", "SW 西南", "W 西", "NW 西北"
     };
 
-    private class Beacon
-    {
-        public float X, Z;
-        public int Color;
-        public string Label;
-    }
-
     public MapForm()
     {
         Text = "深海迷航大地图 SNMap";
@@ -133,17 +143,17 @@ public class MapForm : Form
         smallFont = new Font("Microsoft YaHei UI", 9f);
 
         btnPrev = BlueBtn("－", 8, 8, 40, 30);
-        btnNext = BlueBtn("＋", 8 + 40 + 250 + 8, 8, 40, 30);
+        btnNext = BlueBtn("＋", 306, 8, 40, 30);
         btnExit = BlueBtn("退出", ClientSize.Width - 78, 8, 70, 30);
         lblLayer = new Label();
         lblLayer.Location = new Point(56, 13);
-        lblLayer.Size = new Size(250, 24);
+        lblLayer.Size = new Size(242, 24);
         lblLayer.ForeColor = ThemeAccentDark;
         lblLayer.Font = new Font("Microsoft YaHei UI", 10.5f, FontStyle.Bold);
         lblLayer.TextAlign = ContentAlignment.MiddleCenter;
 
         chkFollow = new CheckBox();
-        chkFollow.Text = "跟随玩家";
+        chkFollow.Text = "跟随";
         chkFollow.Checked = true;
         chkFollow.Location = new Point(8, 44);
         chkFollow.AutoSize = true;
@@ -151,39 +161,42 @@ public class MapForm : Form
         Controls.Add(chkFollow);
 
         chkTop = new CheckBox();
-        chkTop.Text = "窗口置顶";
+        chkTop.Text = "置顶";
         chkTop.Checked = true;
-        chkTop.Location = new Point(100, 44);
+        chkTop.Location = new Point(78, 44);
         chkTop.AutoSize = true;
         chkTop.CheckedChanged += delegate { TopMost = chkTop.Checked; };
         Controls.Add(chkTop);
 
         Label lmini = new Label();
         lmini.Text = "小地图:";
-        lmini.Location = new Point(200, 47);
+        lmini.Location = new Point(140, 46);
         lmini.AutoSize = true;
         lmini.ForeColor = ThemeText;
         Controls.Add(lmini);
 
         txtMini = new TextBox();
-        txtMini.Location = new Point(258, 43);
+        txtMini.Location = new Point(198, 42);
         txtMini.Size = new Size(48, 24);
         Controls.Add(txtMini);
 
-        btnApply = BlueBtn("应用", 310, 43, 48, 30);
+        btnApply = BlueBtn("应用", 250, 41, 48, 26);
         btnApply.Click += delegate { ApplyMiniSize(); };
         Controls.Add(btnApply);
 
         chkCreatures = new CheckBox();
         chkCreatures.Text = "攻击性生物";
         chkCreatures.Checked = true;
-        chkCreatures.Location = new Point(366, 45);
+        chkCreatures.Location = new Point(306, 44);
         chkCreatures.AutoSize = true;
-        chkCreatures.CheckedChanged += delegate { WriteByteAt(OffShowCreatures, (byte)(chkCreatures.Checked ? 1 : 0)); };
+        chkCreatures.CheckedChanged += delegate
+        {
+            WriteSettingsKey("ShowCreatures", chkCreatures.Checked ? "1" : "0");
+        };
         Controls.Add(chkCreatures);
 
         lblInfo = new Label();
-        lblInfo.Location = new Point(470, 47);
+        lblInfo.Location = new Point(410, 46);
         lblInfo.AutoSize = true;
         lblInfo.ForeColor = ThemeAccentDark;
         lblInfo.Font = smallFont;
@@ -194,12 +207,12 @@ public class MapForm : Form
         Controls.Add(btnExit);
         Controls.Add(lblLayer);
 
-        btnPrev.Click += delegate { SwitchLayer(-1); };
-        btnNext.Click += delegate { SwitchLayer(1); };
-        btnExit.Click += delegate { exiting = true; Close(); };
-
         LoadLayers();
-        if (layers.Count > 0) lblLayer.Text = Layer().Name + "  (" + (layerIdx + 1) + "/" + layers.Count + ")";
+        if (layers.Count > 0)
+        {
+            MapLayer l0 = Layer();
+            lblLayer.Text = l0.Name + "  (" + (layerIdx + 1) + "/" + layers.Count + ")" + (l0.Calibrated ? "" : "  [仅浏览]");
+        }
 
         FormClosing += delegate(object s, FormClosingEventArgs e)
         {
@@ -207,7 +220,7 @@ public class MapForm : Form
             {
                 e.Cancel = true;
                 Hide();
-                WriteShowFlag(false);
+                WriteSettingsKey("ShowWindow", "0");
             }
         };
 
@@ -237,10 +250,10 @@ public class MapForm : Form
     private MapLayer Layer()
     {
         if (layers.Count == 0) return null;
-        return layers[Mathf_Clamp(layerIdx, 0, layers.Count - 1)];
+        return layers[ClampI(layerIdx, 0, layers.Count - 1)];
     }
 
-    private static int Mathf_Clamp(int v, int a, int b)
+    private static int ClampI(int v, int a, int b)
     {
         return v < a ? a : (v > b ? b : v);
     }
@@ -266,7 +279,6 @@ public class MapForm : Form
             }
         }
         catch (Exception) { }
-        worldRange = defRange;
 
         if (Directory.Exists(mapsDir))
         {
@@ -277,7 +289,7 @@ public class MapForm : Form
                 if (ext == ".png" || ext == ".jpg" || ext == ".jpeg") files.Add(f);
             }
             files.Sort(StringComparer.Ordinal);
-            Dictionary<string, float[]> ini = ParseMapsIni(Path.Combine(mapsDir, "maps.ini"));
+            Dictionary<string, float[]> ini = Proto.ParseMapsIni(Path.Combine(mapsDir, "maps.ini"));
             for (int i = 0; i < files.Count; i++)
             {
                 MapLayer L = new MapLayer();
@@ -298,7 +310,6 @@ public class MapForm : Form
                 else
                 {
                     L.MinX = -defRange; L.MaxX = defRange; L.MinZ = -defRange; L.MaxZ = defRange;
-                    // 非方形且未标定 -> 仅浏览
                     try
                     {
                         using (Image probe = Image.FromFile(files[i]))
@@ -326,36 +337,7 @@ public class MapForm : Form
         viewCX = 0; viewCZ = 0;
     }
 
-    private static Dictionary<string, float[]> ParseMapsIni(string path)
-    {
-        Dictionary<string, float[]> res = new Dictionary<string, float[]>();
-        try
-        {
-            if (!File.Exists(path)) return res;
-            string[] lines = File.ReadAllLines(path);
-            for (int i = 0; i < lines.Length; i++)
-            {
-                string line = lines[i].Trim();
-                if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
-                int eq = line.IndexOf('=');
-                if (eq <= 0) continue;
-                string name = line.Substring(0, eq).Trim();
-                string[] parts = line.Substring(eq + 1).Split(new char[] { ',' });
-                if (parts.Length < 4) continue;
-                float[] b = new float[4];
-                bool ok = true;
-                for (int k = 0; k < 4; k++)
-                {
-                    if (!float.TryParse(parts[k].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out b[k])) { ok = false; break; }
-                }
-                if (ok) res[name] = b;
-            }
-        }
-        catch (Exception) { }
-        return res;
-    }
-
-    // 生成 mip 金字塔: 4096 -> 2048 -> ... -> 256, 一次性预缩放, 之后每帧只做块拷贝
+    // mip 金字塔: 4096 -> 2048 -> ... -> 256, 一次性预缩放, 之后每帧只做块拷贝
     private void EnsureMips(MapLayer L)
     {
         if (L.Mips != null || !File.Exists(L.Path)) return;
@@ -407,62 +389,28 @@ public class MapForm : Form
             old.MipPxPerM = null;
         }
         lblLayer.Text = nw.Name + "  (" + (layerIdx + 1) + "/" + layers.Count + ")" + (nw.Calibrated ? "" : "  [仅浏览]");
-        WriteLayerIdx();
+        WriteSettingsKey("WindowLayer", layerIdx.ToString());
         Invalidate();
     }
 
-    // ------------------------------------------------------------- shared memory
+    // ------------------------------------------------------------- settings file
 
-    private void EnsureMmf()
+    private string SettingsPath()
     {
-        if (acc != null) return;
-        try
-        {
-            mmf = MemoryMappedFile.OpenExisting(MmfName);
-            acc = mmf.CreateViewAccessor();
-        }
-        catch (Exception)
-        {
-            acc = null;
-        }
+        return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, Proto.SettingsFileName);
     }
 
-    private void WriteShowFlag(bool on)
+    private void WriteSettingsKey(string key, string val)
     {
         try
         {
-            EnsureMmf();
-            if (acc != null) acc.Write(OffShowWindow, (byte)(on ? 1 : 0));
-        }
-        catch (Exception) { }
-    }
-
-    private void WriteLayerIdx()
-    {
-        try
-        {
-            EnsureMmf();
-            if (acc != null) acc.Write(OffWindowLayer, layerIdx);
-        }
-        catch (Exception) { }
-    }
-
-    private void WriteByteAt(int off, byte v)
-    {
-        try
-        {
-            EnsureMmf();
-            if (acc != null) acc.Write(off, v);
-        }
-        catch (Exception) { }
-    }
-
-    private void WriteIntAt(int off, int v)
-    {
-        try
-        {
-            EnsureMmf();
-            if (acc != null) acc.Write(off, v);
+            string p = SettingsPath();
+            Dictionary<string, string> d = Proto.ParseIniStrings(p);
+            d[key] = val;
+            List<string> outLines = new List<string>();
+            foreach (KeyValuePair<string, string> kv in d) outLines.Add(kv.Key + "=" + kv.Value);
+            File.WriteAllLines(p, outLines.ToArray());
+            settingsStamp = DateTime.MinValue;
         }
         catch (Exception) { }
     }
@@ -475,143 +423,19 @@ public class MapForm : Form
             MessageBox.Show(this, "请输入数字, 例如 360", "SNMap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
-        v = Math.Max(120, Math.Min(800, v));
+        v = ClampI(v, 120, 800);
         txtMini.Text = v.ToString();
-        WriteIntAt(OffMinimapPixels, v);
-        SaveConfigMini(v);
+        WriteSettingsKey("MinimapPixels", v.ToString());
     }
 
-    private void SaveConfigMini(int v)
-    {
-        try
-        {
-            string cfg = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.ini");
-            if (!File.Exists(cfg))
-            {
-                File.WriteAllLines(cfg, new string[] { "MinimapPixels=" + v });
-                return;
-            }
-            string[] lines = File.ReadAllLines(cfg);
-            bool found = false;
-            for (int i = 0; i < lines.Length; i++)
-            {
-                if (lines[i].TrimStart().StartsWith("MinimapPixels=", StringComparison.OrdinalIgnoreCase))
-                {
-                    lines[i] = "MinimapPixels=" + v;
-                    found = true;
-                }
-            }
-            if (!found)
-            {
-                Array.Resize(ref lines, lines.Length + 1);
-                lines[lines.Length - 1] = "MinimapPixels=" + v;
-            }
-            File.WriteAllLines(cfg, lines);
-        }
-        catch (Exception) { }
-    }
+    // ------------------------------------------------------------- state read + tick
 
     private void Tick()
     {
-        if (!mmfTried || acc != null) EnsureMmf();
-        bool show = lastShowFlag;
-        hasGame = false;
-        beacons = new List<Beacon>();
-        if (acc != null)
-        {
-            try
-            {
-                show = acc.ReadByte(OffShowWindow) != 0;
-                if (acc.ReadInt32(OffPlayerValid) == 1)
-                {
-                    hasGame = true;
-                    px = acc.ReadSingle(OffX);
-                    py = acc.ReadSingle(OffY);
-                    pz = acc.ReadSingle(OffZ);
-                    heading = acc.ReadSingle(OffHeading);
-                    int bl = acc.ReadInt32(OffBiomeLen);
-                    if (bl > 0 && bl < 64)
-                    {
-                        byte[] b = new byte[bl];
-                        acc.ReadArray(OffBiome, b, 0, bl);
-                        biome = Encoding.UTF8.GetString(b);
-                    }
-                    else biome = "";
-                    int n = acc.ReadInt32(OffBeaconCount);
-                    if (n > 32) n = 32;
-                    for (int i = 0; i < n; i++)
-                    {
-                        int off = OffBeacons + i * 128;
-                        Beacon bk = new Beacon();
-                        bk.X = acc.ReadSingle(off);
-                        bk.Z = acc.ReadSingle(off + 4);
-                        bk.Color = acc.ReadInt32(off + 8);
-                        int ll = acc.ReadInt32(off + 16);
-                        if (ll > 0 && ll < 64)
-                        {
-                            byte[] b = new byte[ll];
-                            acc.ReadArray(off + 20, b, 0, ll);
-                            bk.Label = Encoding.UTF8.GetString(b);
-                        }
-                        beacons.Add(bk);
-                    }
+        ReadStateFile();
 
-                    int cn = acc.ReadInt32(OffCreatureCount);
-                    if (cn > 24) cn = 24;
-                    creatureWin.Clear();
-                    for (int i = 0; i < cn; i++)
-                    {
-                        int off = OffCreatures + i * 80;
-                        CreaturePt c = new CreaturePt();
-                        c.X = acc.ReadSingle(off);
-                        c.Z = acc.ReadSingle(off + 4);
-                        int ll = acc.ReadInt32(off + 8);
-                        if (ll > 0 && ll < 67)
-                        {
-                            byte[] b = new byte[ll];
-                            acc.ReadArray(off + 12, b, 0, ll);
-                            c.Label = Encoding.UTF8.GetString(b);
-                        }
-                        creatureWin.Add(c);
-                    }
-                }
-                mmfTried = true;
-            }
-            catch (Exception)
-            {
-                acc = null;
-                mmfTried = false;
-            }
-        }
-        else
-        {
-            mmfTried = false;
-        }
-
-        if (firstTick)
-        {
-            // 启动首拍: 只要游戏已注入就主动置显示标志并保持可见; 未注入则停留等待页
-            firstTick = false;
-            if (acc != null)
-            {
-                WriteShowFlag(true);
-                show = true;
-                try
-                {
-                    int px = acc.ReadInt32(OffMinimapPixels);
-                    if (px >= 120 && px <= 800) txtMini.Text = px.ToString();
-                    chkCreatures.Checked = acc.ReadByte(OffShowCreatures) != 0;
-                }
-                catch (Exception) { }
-            }
-        }
-        else if (acc != null && show != Visible)
-        {
-            // 只有在游戏已注入(共享内存存在)时才跟随 F9 标志显隐
-            if (show) ShowNoActivate();
-            else Hide();
-        }
-        // acc == null: 游戏未注入, 保持窗口可见显示等待提示
+        tickCount++;
+        if (tickCount % 3 == 0) PollSettings();
 
         if (follow && hasGame)
         {
@@ -620,10 +444,9 @@ public class MapForm : Form
             ClampView();
         }
         lblInfo.Text = hasGame
-            ? string.Format("X {0:F0}   Z {1:F0}   深度 {2:F0}m   {3}   {4}", px, pz, py, Heading8(heading), biome)
-            : "等待游戏数据 (启动游戏并注入 SNMap 后自动连接)";
+            ? string.Format("模块v{0} | X {1:F0}   Z {2:F0}   深度 {3:F0}m   {4}   {5}", modVer, px, pz, py, Heading8(heading), biome)
+            : (modVer.StartsWith("协议") ? modVer : "等待游戏数据 (启动游戏并注入 SNMap 后自动连接)");
 
-        // 脏检查: 状态没变化就不重绘(跟随移动/转向/信标增减才算变化)
         if (Visible)
         {
             bool changed = hasGame != lastHasGame
@@ -631,48 +454,111 @@ public class MapForm : Form
                 || Math.Abs(px - lastPx) > 0.01f
                 || Math.Abs(pz - lastPz) > 0.01f
                 || Math.Abs(heading - lastHeading) > 0.2f
-                || beaconBuf.Count != lastBeaconKey;
+                || beacons.Count != lastBeaconKey
+                || creatureWin.Count != lastCreatureKey;
             if (changed)
             {
                 lastPx = px; lastPz = pz; lastHeading = heading;
-                lastHasGame = hasGame; lastBiome = biome; lastBeaconKey = beaconBuf.Count;
+                lastHasGame = hasGame; lastBiome = biome;
+                lastBeaconKey = beacons.Count; lastCreatureKey = creatureWin.Count;
                 Invalidate(MapArea());
             }
         }
-        beacons = beaconBuf;
     }
 
-    // 按当前缩放档位预缩放图层到缓存位图(切层/跨档/改尺寸才重建一次)
-    private float FitScale(MapLayer L)
+    private void ReadStateFile()
     {
-        Rectangle r = MapArea();
-        float w = L.MaxX - L.MinX, h = L.MaxZ - L.MinZ;
-        if (w <= 0f || h <= 0f) return 0.1f;
-        return Math.Min(r.Width / w, r.Height / h);
+        hasGame = false;
+        beacons.Clear();
+        creatureWin.Clear();
+        try
+        {
+            string sp = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, Proto.StateFileName);
+            if (!File.Exists(sp)) throw new Exception();
+            byte[] buf = File.ReadAllBytes(sp);
+            if (buf.Length < 128 || GetInt(buf, OffMagic) != Magic) throw new Exception();
+            int ver = GetInt(buf, OffVersion);
+            if (ver != ProtoVersion)
+            {
+                modVer = "协议不匹配(" + ver + "), 请重新注入";
+                return;
+            }
+            modVer = GetString(buf, OffModVerLen, OffModVer, 32);
+            if (GetInt(buf, OffPlayerValid) != 1) return;
+            hasGame = true;
+            px = GetFloat(buf, OffX);
+            py = GetFloat(buf, OffY);
+            pz = GetFloat(buf, OffZ);
+            heading = GetFloat(buf, OffHeading);
+            biome = GetString(buf, OffBiomeLen, OffBiome, 64);
+
+            int n = ClampI(GetInt(buf, OffBeaconCount), 0, 32);
+            for (int i = 0; i < n; i++)
+            {
+                int off = OffBeacons + i * 128;
+                Beacon bk = new Beacon();
+                bk.X = GetFloat(buf, off);
+                bk.Z = GetFloat(buf, off + 4);
+                bk.Color = GetInt(buf, off + 8);
+                bk.Label = GetString(buf, off + 16, off + 20, 63);
+                beacons.Add(bk);
+            }
+            int cn = ClampI(GetInt(buf, OffCreatureCount), 0, 24);
+            for (int i = 0; i < cn; i++)
+            {
+                int off = OffCreatures + i * 80;
+                CreaturePt c = new CreaturePt();
+                c.X = GetFloat(buf, off);
+                c.Z = GetFloat(buf, off + 4);
+                c.Label = GetString(buf, off + 8, off + 12, 66);
+                creatureWin.Add(c);
+            }
+            noStateTicks = 0;
+        }
+        catch (Exception)
+        {
+            noStateTicks++;
+            // 游戏退出后状态文件消失: --auto 待命的隐藏窗口 10 秒后自动退出
+            if (noStateTicks > 300 && !Visible && Program.AutoStart)
+            {
+                exiting = true;
+                Close();
+            }
+        }
     }
 
-    private void ClampView()
+    private void PollSettings()
     {
-        MapLayer L = Layer();
-        if (L == null || !L.Calibrated) return;
-        Rectangle r = MapArea();
-        float s = FitScale(L) * zoom;
-        float halfW = r.Width / 2f / s, halfH = r.Height / 2f / s;
-        float w = L.MaxX - L.MinX, h = L.MaxZ - L.MinZ;
-        viewCX = w <= halfW * 2f ? (L.MinX + L.MaxX) / 2f
-            : Math.Max(L.MinX + halfW, Math.Min(L.MaxX - halfW, viewCX));
-        viewCZ = h <= halfH * 2f ? (L.MinZ + L.MaxZ) / 2f
-            : Math.Max(L.MinZ + halfH, Math.Min(L.MaxZ - halfH, viewCZ));
+        if (tickCount % 3 != 0) return;
+        try
+        {
+            string p = SettingsPath();
+            if (!File.Exists(p)) return;
+            DateTime wt = File.GetLastWriteTimeUtc(p);
+            if (wt == settingsStamp) return;
+            settingsStamp = wt;
+            Dictionary<string, string> d = Proto.ParseIniStrings(p);
+            string s;
+            if (d.TryGetValue("ShowWindow", out s))
+            {
+                bool wantShow = s == "1";
+                if (wantShow && !Visible) ShowNoActivate();
+                if (!wantShow && Visible) Hide();
+            }
+            if (d.TryGetValue("MinimapPixels", out s))
+            {
+                int v;
+                if (int.TryParse(s, out v) && v >= 120 && v <= 800) txtMini.Text = v.ToString();
+            }
+            if (d.TryGetValue("ShowCreatures", out s)) chkCreatures.Checked = s != "0";
+        }
+        catch (Exception) { }
     }
 
     private void ShowNoActivate()
     {
         Show();
-        try
-        {
-            ShowWindow(Handle, 8); // SW_SHOWNOACTIVATE
-        }
-        catch (Exception) { }
+        try { ShowWindow(Handle, 8); } catch (Exception) { }
     }
 
     [DllImport("user32.dll")]
@@ -680,7 +566,24 @@ public class MapForm : Form
 
     private static string Heading8(float deg)
     {
-        return Headings[((int)Math.Round(deg / 45f)) % 8];
+        return Headings[ClampI((int)Math.Round(deg / 45f), 0, 359) / 45 % 8];
+    }
+
+    private static int GetInt(byte[] b, int off)
+    {
+        return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24);
+    }
+
+    private static float GetFloat(byte[] b, int off)
+    {
+        return BitConverter.ToSingle(b, off);
+    }
+
+    private static string GetString(byte[] b, int lenOff, int strOff, int max)
+    {
+        int len = GetInt(b, lenOff);
+        if (len <= 0 || len > max) return "";
+        return Encoding.UTF8.GetString(b, strOff, len);
     }
 
     // ------------------------------------------------------------- painting
@@ -690,23 +593,12 @@ public class MapForm : Form
         return new Rectangle(0, 74, ClientSize.Width, ClientSize.Height - 74);
     }
 
-    private readonly Pen beaconPen = new Pen(Color.FromArgb(200, 10, 10, 10), 2f);
-    private SolidBrush[] pingBrushes;
-    private readonly Pen scalePen = new Pen(Color.White, 3f);
-    private readonly SolidBrush arrowFill = new SolidBrush(Color.FromArgb(235, 255, 70, 70));
-    private readonly Pen arrowPen = new Pen(Color.FromArgb(220, 10, 10, 10), 2f);
-    private readonly SolidBrush shadowBrush = new SolidBrush(Color.FromArgb(200, 0, 0, 0));
-    private readonly SolidBrush mapBgBrush = new SolidBrush(MapBg);
-
-    private SolidBrush PingBrush(int idx)
+    private float FitScale(MapLayer L)
     {
-        int i = ((idx % PingColors.Length) + PingColors.Length) % PingColors.Length;
-        if (pingBrushes == null || pingBrushes.Length != PingColors.Length)
-        {
-            pingBrushes = new SolidBrush[PingColors.Length];
-            for (int k = 0; k < PingColors.Length; k++) pingBrushes[k] = new SolidBrush(PingColors[k]);
-        }
-        return pingBrushes[i];
+        Rectangle r = MapArea();
+        float w = L.MaxX - L.MinX, h = L.MaxZ - L.MinZ;
+        if (w <= 0f || h <= 0f) return 0.1f;
+        return Math.Min(r.Width / w, r.Height / h);
     }
 
     private PointF WorldToScreen(MapLayer L, float wx, float wz)
@@ -765,7 +657,6 @@ public class MapForm : Form
 
         if (L.Calibrated)
         {
-            // 信标
             foreach (Beacon bk in beacons)
             {
                 PointF sp = WorldToScreen(L, bk.X, bk.Z);
@@ -773,12 +664,9 @@ public class MapForm : Form
                 g.FillEllipse(PingBrush(bk.Color), sp.X - 6f, sp.Y - 6f, 12f, 12f);
                 g.DrawEllipse(beaconPen, sp.X - 6f, sp.Y - 6f, 12f, 12f);
                 if (!string.IsNullOrEmpty(bk.Label))
-                {
                     DrawShadowText(g, bk.Label, mapFont, sp.X + 9f, sp.Y - 10f);
-                }
             }
 
-            // 玩家箭头
             if (hasGame)
             {
                 PointF pp = WorldToScreen(L, px, pz);
@@ -795,7 +683,6 @@ public class MapForm : Form
                 g.Restore(state);
             }
 
-            // 攻击性生物(红色警示三角)
             if (chkCreatures != null && chkCreatures.Checked)
             {
                 foreach (CreaturePt c in creatureWin)
@@ -812,7 +699,6 @@ public class MapForm : Form
                 }
             }
 
-            // 比例尺
             float mPerPx = 1f / Math.Max(vs, 0.0001f);
             float barMeters = 200f;
             float barPx = barMeters / mPerPx;
@@ -830,20 +716,45 @@ public class MapForm : Form
 
         if (!hasGame)
         {
-            string msg = "等待游戏数据 — 请启动游戏并运行 SNInjector.exe 注入";
+            string msg = modVer.StartsWith("协议") ? modVer : "等待游戏数据 — 请启动游戏并运行 SNInjector.exe 注入";
             SizeF sz = g.MeasureString(msg, mapFont);
             g.FillRectangle(shadowBrush, r.Width / 2f - sz.Width / 2f - 10f, r.Top + 14f, sz.Width + 20f, sz.Height + 8f);
             g.DrawString(msg, mapFont, Brushes.White, r.Width / 2f - sz.Width / 2f, r.Top + 18f);
         }
     }
 
+    private SolidBrush PingBrush(int idx)
+    {
+        int i = ((idx % PingColors.Length) + PingColors.Length) % PingColors.Length;
+        if (pingBrushes == null || pingBrushes.Length != PingColors.Length)
+        {
+            pingBrushes = new SolidBrush[PingColors.Length];
+            for (int k = 0; k < PingColors.Length; k++) pingBrushes[k] = new SolidBrush(PingColors[k]);
+        }
+        return pingBrushes[i];
+    }
+
     private void DrawShadowText(Graphics g, string text, Font f, float x, float y)
     {
-        g.DrawString(text, f, new SolidBrush(Color.FromArgb(200, 0, 0, 0)), x + 1.5f, y + 1.5f);
+        g.DrawString(text, f, shadowBrush, x + 1.5f, y + 1.5f);
         g.DrawString(text, f, Brushes.White, x, y);
     }
 
     // ------------------------------------------------------------- input
+
+    private void ClampView()
+    {
+        MapLayer L = Layer();
+        if (L == null || !L.Calibrated) return;
+        Rectangle r = MapArea();
+        float s = FitScale(L) * zoom;
+        float halfW = r.Width / 2f / s, halfH = r.Height / 2f / s;
+        float w = L.MaxX - L.MinX, h = L.MaxZ - L.MinZ;
+        viewCX = w <= halfW * 2f ? (L.MinX + L.MaxX) / 2f
+            : Math.Max(L.MinX + halfW, Math.Min(L.MaxX - halfW, viewCX));
+        viewCZ = h <= halfH * 2f ? (L.MinZ + L.MaxZ) / 2f
+            : Math.Max(L.MinZ + halfH, Math.Min(L.MaxZ - halfH, viewCZ));
+    }
 
     protected override void OnMouseWheel(MouseEventArgs e)
     {
@@ -904,6 +815,7 @@ public class MapForm : Form
         {
             follow = true;
             chkFollow.Checked = true;
+            Invalidate(MapArea());
         }
     }
 }

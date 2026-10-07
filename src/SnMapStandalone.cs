@@ -1,14 +1,12 @@
-// SNMap 独立版 v1.3 (注入器/修改器方式, 无 BepInEx 依赖)
-// 游戏内: 左上角坐标文字 + 圆形小地图(F7 循环 200/300/500)
-// F9: 显示/隐藏独立大地图窗口 (SNMapWindow.exe, 通过共享内存 SNMapState 通信)
-// 本模块每帧把 玩家坐标/朝向(相机)/深度/生物群系/信标 写入共享内存供地图窗口读取
-// 朝向: 使用渲染相机 MainCamera.camera (Player.main.transform 不随视角旋转!) + 经验修正180
+// SNMap 游戏内模块 v2.0 (BepInEx-free, 注入器方式加载)
+// 职责: 左上角坐标 HUD + 圆形小地图 + 共享内存状态写入(供独立大地图窗口 SNMapWindow.exe 使用)
+// 朝向: MainCamera.camera 的 forward(经验修正+180); Player.main.transform 不随视角旋转
+// 扫描室信号(PingType.Signal) 只显示在小地图(橙色), 不发给大地图窗口
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-using System.IO.MemoryMappedFiles;
 using System.Reflection;
 using System.Text;
 using UnityEngine;
@@ -70,7 +68,7 @@ namespace SNMap
                 sb.AppendLine("FontSize=" + FontSize);
                 sb.AppendLine("WorldRange=" + WorldRange.ToString("0", CultureInfo.InvariantCulture));
                 sb.AppendLine("MinimapPixels=" + MinimapPixels);
-                sb.AppendLine("# 小地图各档显示范围(米), 逗号分隔, F7 循环: 关->第1档->第2档->...");
+                sb.AppendLine("# 小地图各档显示范围(米), 逗号分隔, F7 循环: 关->第1档->...");
                 sb.AppendLine("MinimapSpans=200,300,500,1000");
                 try { File.WriteAllText(path, sb.ToString()); } catch (Exception) { }
                 return;
@@ -141,31 +139,6 @@ namespace SNMap
         public bool HasIniBounds;
     }
 
-    // 共享内存布局 (游戏模块写, 地图窗口读; 窗口只写 windowLayer/showWindow 反馈)
-    internal static class SharedState
-    {
-        public const string MmfName = "SNMapState_1";
-        public const int OffMagic = 0;        // int  0x534E4D50
-        public const int OffVersion = 4;      // int  1
-        public const int OffTick = 8;         // long
-        public const int OffPlayerValid = 16; // int
-        public const int OffX = 20;           // float
-        public const int OffY = 24;           // float (深度)
-        public const int OffZ = 28;           // float
-        public const int OffHeading = 32;     // float 角度(顺时针, 0=北)
-        public const int OffShowWindow = 36;  // byte
-        public const int OffBeaconCount = 40; // int
-        public const int OffBiomeLen = 44;    // int
-        public const int OffBiome = 48;       // 64B utf8
-        public const int OffBeacons = 128;    // 32 * 128B: x(0f) z(4f) color(8i) visible(12i) labelLen(16i) label(20+64B)
-        public const int OffWindowLayer = 4224; // int (窗口写: 当前图层索引)
-        public const int OffWorldRange = 4228;  // float (模块写: 默认标定半径)
-        public const int OffMinimapPixels = 4232; // int (窗口写: 小地图像素大小)
-        public const int OffShowCreatures = 4236; // byte (窗口写: 是否显示攻击性生物)
-        public const int OffCreatureCount = 4240; // int (模块写)
-        public const int OffCreatures = 4248;     // 24 * 80B: x(0f) z(4f) labelLen(8i) label(12+68B)
-    }
-
     public class SnMapBehaviour : MonoBehaviour
     {
         private Texture2D arrowTex;
@@ -180,12 +153,14 @@ namespace SNMap
         private List<MapLayer> layers = new List<MapLayer>();
         private FieldInfo pingsDictField;
         private FieldInfo pingColorsField;
-        private bool pingWarned;
 
-        private MemoryMappedFile mmf;
-        private MemoryMappedViewAccessor acc;
+        private byte[] stateBuf;
+        private byte settingsShowWindow;
+        private int windowLayer;
+        private DateTime lastSettingsWrite;
         private int frame;
-        private bool showWindow;
+        private bool showWindow = true;   // 窗口进程的期望状态(与设置文件 ShowWindow 同步)
+        private bool showCreatures = true;
 
         private static readonly string[] Headings = new string[]
         {
@@ -204,28 +179,6 @@ namespace SNMap
             new Color(1f, 0.5f, 1f)
         };
 
-        private static readonly Dictionary<string, string> BiomeCn = new Dictionary<string, string>
-        {
-            { "safeShallows", "浅滩区" },
-            { "kelpForest", "海藻区" },
-            { "grassyPlateaus", "红藻区" },
-            { "mushroomForest", "蘑菇林" },
-            { "kooshZone", "库什区" },
-            { "mountains", "山脉区" },
-            { "crashZone", "坠毁区" },
-            { "dunes", "沙丘区" },
-            { "grandReef", "水雷区" },
-            { "underIslands", "浮岛区" },
-            { "sparseReef", "暗礁区" },
-            { "seaTreadersPath", "踏浪者小径" },
-            { "bloodKelp", "血藻区" },
-            { "lostRiver", "失落之河" },
-            { "inactiveLavaZone", "非活跃熔岩区" },
-            { "lavaLakes", "熔岩湖" },
-            { "activeLavaZone", "活跃熔岩区" },
-            { "void", "虚空" }
-        };
-
         private void Awake()
         {
             LoadFont();
@@ -234,45 +187,12 @@ namespace SNMap
             BuildRingTexture(Cfg.MinimapPixels);
             LoadLayers();
             LoadPingsApi();
-            InitSharedMemory();
+            stateBuf = new byte[8192];
             if (layers.Count > 0) GetTex(layers[0]);
 
-            Cfg.Log("SNMap 1.3 awake | layers=" + layers.Count +
+            Cfg.Log("SNMap 2.0 awake | layers=" + layers.Count +
                     " cjk=" + uiFontCjk + " pings=" + (pingsDictField != null) +
-                    " mmf=" + (acc != null) + " bigKey=" + Cfg.ToggleMapKey + " miniKey=" + Cfg.ToggleHudKey);
-        }
-
-        private void InitSharedMemory()
-        {
-            try
-            {
-                mmf = MemoryMappedFile.CreateOrOpen(SharedState.MmfName, 8192, MemoryMappedFileAccess.ReadWrite);
-                acc = mmf.CreateViewAccessor();
-                acc.Write(SharedState.OffMagic, (int)0x534E4D50);
-                acc.Write(SharedState.OffVersion, (int)1);
-                acc.Write(SharedState.OffWorldRange, Cfg.WorldRange);
-                acc.Write(SharedState.OffMinimapPixels, Cfg.MinimapPixels);
-                acc.Write(SharedState.OffShowCreatures, (byte)1);
-                acc.Write(SharedState.OffCreatureCount, 0);
-                // 不清零 showWindow; 若地图窗口已在运行, 保持其可见
-                try
-                {
-                    if (System.Diagnostics.Process.GetProcessesByName("SNMapWindow").Length > 0)
-                        acc.Write(SharedState.OffShowWindow, (byte)1);
-                }
-                catch (Exception) { }
-                Cfg.Log("shared memory ready");
-            }
-            catch (Exception ex)
-            {
-                acc = null;
-                Cfg.Log("shared memory FAILED: " + ex.Message);
-            }
-        }
-
-        private void OnDestroy()
-        {
-            try { if (acc != null) acc.Write(SharedState.OffPlayerValid, 0); } catch (Exception) { }
+                    " bigKey=" + Cfg.ToggleMapKey + " miniKey=" + Cfg.ToggleHudKey);
         }
 
         private void Update()
@@ -280,14 +200,11 @@ namespace SNMap
             KeyCode kc;
             if (Enum.TryParse(Cfg.ToggleMapKey, true, out kc) && Input.GetKeyDown(kc))
             {
-                // 读-翻转-写: 与地图窗口共用同一个标志字节, 避免各自覆盖
-                byte cur = 0;
-                if (acc != null) { try { cur = acc.ReadByte(SharedState.OffShowWindow); } catch (Exception) { } }
+                // 读-翻转-写 设置文件里的 ShowWindow(与地图窗口共用)
+                byte cur = ReadSettingsByte(Proto.KeyShowWindow, 0);
                 showWindow = cur == 0;
-                if (acc != null)
-                {
-                    try { acc.Write(SharedState.OffShowWindow, (byte)(showWindow ? 1 : 0)); } catch (Exception) { }
-                }
+                WriteSettingsKey(Proto.KeyShowWindow, showWindow ? "1" : "0");
+                settingsShowWindow = showWindow ? (byte)1 : (byte)0;
             }
             if (Enum.TryParse(Cfg.ToggleHudKey, true, out kc) && Input.GetKeyDown(kc))
             {
@@ -299,56 +216,146 @@ namespace SNMap
             WriteState();
         }
 
-        // 窗口可以实时改小地图大小/生物开关
-        private void ReadWindowSettings()
+        // 窗口可实时改小地图大小/生物开关/图层(设置文件)
+        private DateTime ReadWindowSettings()
         {
-            if (acc == null || frame % 30 != 0) return;
             try
             {
-                int px = acc.ReadInt32(SharedState.OffMinimapPixels);
-                if (px >= 120 && px <= 800 && px != Cfg.MinimapPixels)
+                string p = Path.Combine(Cfg.BaseDir, Proto.SettingsFileName);
+                if (!File.Exists(p)) return DateTime.MinValue;
+                DateTime wt = File.GetLastWriteTimeUtc(p);
+                if (wt == lastSettingsWrite) return wt;
+                lastSettingsWrite = wt;
+                Dictionary<string, string> d = ReadSettingsFile(p);
+                string s;
+                if (d.TryGetValue(Proto.KeyMinimapPixels, out s))
                 {
-                    Cfg.MinimapPixels = px;
-                    BuildRingTexture(px);
-                    Cfg.Log("minimap size set to " + px + "px by window");
+                    int px;
+                    if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out px) &&
+                        px >= 120 && px <= 800 && px != Cfg.MinimapPixels)
+                    {
+                        Cfg.MinimapPixels = px;
+                        BuildRingTexture(px);
+                        Cfg.Log("minimap size set to " + px + "px by window");
+                    }
                 }
-                showCreatures = acc.ReadByte(SharedState.OffShowCreatures) != 0;
+                if (d.TryGetValue(Proto.KeyShowCreatures, out s)) showCreatures = s != "0";
+                if (d.TryGetValue(Proto.KeyWindowLayer, out s))
+                {
+                    int wi;
+                    if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out wi)) windowLayer = wi;
+                }
+                byte sw = ReadSettingsByte(Proto.KeyShowWindow, 0);
+                settingsShowWindow = sw;
+                showWindow = sw != 0;
+                return wt;
+            }
+            catch (Exception) { return DateTime.MinValue; }
+        }
+
+        private Dictionary<string, string> ReadSettingsFile(string path)
+        {
+            Dictionary<string, string> d = new Dictionary<string, string>();
+            try
+            {
+                if (!File.Exists(path)) return d;
+                string[] lines = File.ReadAllLines(path);
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string line = lines[i].Trim();
+                    if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    d[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+                }
+            }
+            catch (Exception) { }
+            return d;
+        }
+
+        private byte ReadSettingsByte(string key, byte def)
+        {
+            string s = ReadSettingsKey(key);
+            byte v;
+            return (s != null && byte.TryParse(s, out v)) ? v : def;
+        }
+
+        private string ReadSettingsKey(string key)
+        {
+            try
+            {
+                string p = Path.Combine(Cfg.BaseDir, Proto.SettingsFileName);
+                if (!File.Exists(p)) return null;
+                foreach (string ln in File.ReadAllLines(p))
+                {
+                    string line = ln.Trim();
+                    if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    if (line.Substring(0, eq).Trim() == key) return line.Substring(eq + 1).Trim();
+                }
+            }
+            catch (Exception) { }
+            return null;
+        }
+
+        private void WriteSettingsKey(string key, string val)
+        {
+            try
+            {
+                string p = Path.Combine(Cfg.BaseDir, Proto.SettingsFileName);
+                Dictionary<string, string> d = ReadSettingsFile(p);
+                d[key] = val;
+                List<string> outLines = new List<string>();
+                foreach (KeyValuePair<string, string> kv in d) outLines.Add(kv.Key + "=" + kv.Value);
+                File.WriteAllLines(p, outLines.ToArray());
             }
             catch (Exception) { }
         }
 
-        private bool showCreatures = true;
-
         private void WriteState()
         {
-            if (acc == null) return;
+            if (frame % 3 != 0) return; // 20Hz
             try
             {
-                if (frame % 2 != 0) return; // ~30Hz
-                Player pl = Player.main;
-                if (pl == null || pl.transform == null)
-                {
-                    acc.Write(SharedState.OffPlayerValid, 0);
-                    return;
-                }
-                Vector3 p = pl.transform.position;
-                acc.Write(SharedState.OffTick, (long)Environment.TickCount);
-                acc.Write(SharedState.OffPlayerValid, 1);
-                acc.Write(SharedState.OffX, p.x);
-                acc.Write(SharedState.OffY, -p.y);
-                acc.Write(SharedState.OffZ, p.z);
-                acc.Write(SharedState.OffHeading, HeadingAngle());
+                byte[] buf = stateBuf;
+                Array.Clear(buf, 0, buf.Length);
+                PutInt(buf, Proto.OffMagic, Proto.Magic);
+                PutInt(buf, Proto.OffVersion, Proto.Version);
+                PutLong(buf, Proto.OffTick, Environment.TickCount);
+                buf[Proto.OffShowWindow] = settingsShowWindow;
 
-                if (frame % 30 == 0)
+                Player pl = Player.main;
+                int valid = 0;
+                float x = 0f, y = 0f, z = 0f;
+                if (pl != null && pl.transform != null)
+                {
+                    valid = 1;
+                    Vector3 p = pl.transform.position;
+                    x = p.x; y = -p.y; z = p.z;
+                    PutFloat(buf, Proto.OffX, x);
+                    PutFloat(buf, Proto.OffY, y);
+                    PutFloat(buf, Proto.OffZ, z);
+                    PutFloat(buf, Proto.OffHeading, HeadingAngle());
+                }
+                PutInt(buf, Proto.OffPlayerValid, valid);
+
+                if (valid == 1 && frame % 30 == 0)
                 {
                     string biome = null;
-                    try { biome = MapBiome(pl.GetBiomeString()); } catch (Exception) { }
+                    try { biome = Proto.BiomeCnOrNull(pl.GetBiomeString()); } catch (Exception) { }
                     byte[] b = biome == null ? new byte[0] : Encoding.UTF8.GetBytes(biome);
                     if (b.Length > 63) Array.Resize(ref b, 63);
-                    acc.Write(SharedState.OffBiomeLen, b.Length);
-                    if (b.Length > 0) acc.WriteArray(SharedState.OffBiome, b, 0, b.Length);
+                    PutInt(buf, Proto.OffBiomeLen, b.Length);
+                    PutBytes(buf, Proto.OffBiome, b);
+                    WriteBeacons(pl, buf);
+                }
+                PutInt(buf, Proto.OffCreatureCount, creatureCount);
 
-                    WriteBeacons(pl);
+                string sp = Path.Combine(Cfg.BaseDir, Proto.StateFileName);
+                using (FileStream fs = new FileStream(sp, FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
+                {
+                    fs.Write(buf, 0, buf.Length);
                 }
             }
             catch (Exception ex)
@@ -357,7 +364,28 @@ namespace SNMap
             }
         }
 
-        private void WriteBeacons(Player pl)
+        private static void PutInt(byte[] b, int off, int v)
+        {
+            b[off] = (byte)v; b[off + 1] = (byte)(v >> 8); b[off + 2] = (byte)(v >> 16); b[off + 3] = (byte)(v >> 24);
+        }
+
+        private static void PutFloat(byte[] b, int off, float v)
+        {
+            PutInt(b, off, BitConverter.ToInt32(BitConverter.GetBytes(v), 0));
+        }
+
+        private static void PutLong(byte[] b, int off, long v)
+        {
+            for (int i = 0; i < 8; i++) b[off + i] = (byte)(v >> (8 * i));
+        }
+
+        private static void PutBytes(byte[] b, int off, byte[] data)
+        {
+            if (data == null || data.Length == 0) return;
+            Buffer.BlockCopy(data, 0, b, off, data.Length);
+        }
+
+        private void WriteBeacons(Player pl, byte[] buf)
         {
             List<PingInstance> list = GetPings();
             if (list == null) return;
@@ -371,31 +399,31 @@ namespace SNMap
             sorted.Sort(delegate(PingInstance a, PingInstance b)
             {
                 Vector3 pa = a.GetPosition(), pb = b.GetPosition();
-                float da = (pa - pp).sqrMagnitude, db = (pb - pp).sqrMagnitude;
-                return da.CompareTo(db);
+                return (pa - pp).sqrMagnitude.CompareTo((pb - pp).sqrMagnitude);
             });
-            int n = Mathf.Min(sorted.Count, 32);
-            acc.Write(SharedState.OffBeaconCount, n);
+            int n = Mathf.Min(sorted.Count, Proto.MaxBeacons);
+            PutInt(buf, Proto.OffBeaconCount, n);
             for (int i = 0; i < n; i++)
             {
                 PingInstance pi = sorted[i];
                 Vector3 q = pi.GetPosition();
-                int off = SharedState.OffBeacons + i * 128;
-                acc.Write(off, q.x);
-                acc.Write(off + 4, q.z);
-                acc.Write(off + 8, pi.colorIndex >= 0 ? pi.colorIndex : 0);
-                acc.Write(off + 12, 1);
+                int off = Proto.OffBeacons + i * 128;
+                PutFloat(buf, off, q.x);
+                PutFloat(buf, off + 4, q.z);
+                PutInt(buf, off + 8, pi.colorIndex >= 0 ? pi.colorIndex : 0);
+                PutInt(buf, off + 12, 1);
                 string lbl = pi.GetLabel();
                 byte[] b = string.IsNullOrEmpty(lbl) ? new byte[0] : Encoding.UTF8.GetBytes(lbl);
                 if (b.Length > 63) Array.Resize(ref b, 63);
-                acc.Write(off + 16, b.Length);
-                if (b.Length > 0) acc.WriteArray(off + 20, b, 0, b.Length);
+                PutInt(buf, off + 16, b.Length);
+                PutBytes(buf, off + 20, b);
             }
 
-            // 攻击性生物(每 60 帧=1秒 扫一次, 取最近 24 只)
+            // 攻击性生物(每 60 帧=1秒 扫一次, 取最近 24 只, 600m 内)
             if (!showCreatures)
             {
-                acc.Write(SharedState.OffCreatureCount, 0);
+                PutInt(buf, Proto.OffCreatureCount, 0);
+                creatureCount = 0;
                 return;
             }
             if (frame % 60 != 0 && lastCreatureFrame != 0 && frame - lastCreatureFrame < 60) return;
@@ -408,35 +436,38 @@ namespace SNMap
                 {
                     if (c == null || !c.gameObject.activeInHierarchy) continue;
                     if (c.GetComponent<AggressiveWhenSeeTarget>() == null && c.GetComponent<AttackLastTarget>() == null) continue;
-                    if ((c.transform.position - pp).sqrMagnitude > 360000f) continue; // 600m
+                    if ((c.transform.position - pp).sqrMagnitude > 360000f) continue;
                     aggr.Add(c);
                 }
                 aggr.Sort(delegate(Creature a, Creature b)
                 {
                     return (a.transform.position - pp).sqrMagnitude.CompareTo((b.transform.position - pp).sqrMagnitude);
                 });
-                int cn = Mathf.Min(aggr.Count, 24);
-                acc.Write(SharedState.OffCreatureCount, cn);
+                int cn = Mathf.Min(aggr.Count, Proto.MaxCreatures);
+                PutInt(buf, Proto.OffCreatureCount, cn);
+                creatureCount = cn;
                 for (int i = 0; i < cn; i++)
                 {
                     Vector3 q = aggr[i].transform.position;
-                    int off = SharedState.OffCreatures + i * 80;
-                    acc.Write(off, q.x);
-                    acc.Write(off + 4, q.z);
+                    int off = Proto.OffCreatures + i * 80;
+                    PutFloat(buf, off, q.x);
+                    PutFloat(buf, off + 4, q.z);
                     string nm = CreatureName(aggr[i]);
                     byte[] nb = string.IsNullOrEmpty(nm) ? new byte[0] : Encoding.UTF8.GetBytes(nm);
                     if (nb.Length > 66) Array.Resize(ref nb, 66);
-                    acc.Write(off + 8, nb.Length);
-                    if (nb.Length > 0) acc.WriteArray(off + 12, nb, 0, nb.Length);
+                    PutInt(buf, off + 8, nb.Length);
+                    PutBytes(buf, off + 12, nb);
                 }
             }
             catch (Exception ex)
             {
-                acc.Write(SharedState.OffCreatureCount, 0);
+                PutInt(buf, Proto.OffCreatureCount, 0);
+                creatureCount = 0;
                 if (frame % 1800 == 0) Cfg.Log("creature scan failed: " + ex.Message);
             }
         }
 
+        private int creatureCount;
         private int lastCreatureFrame;
 
         private static string CreatureName(Creature c)
@@ -462,7 +493,7 @@ namespace SNMap
             float depth = -pos.y;
             try { depth = pl.GetDepth(); } catch (Exception) { }
             string biome = null;
-            try { biome = MapBiome(pl.GetBiomeString()); } catch (Exception) { }
+            try { biome = Proto.BiomeCnOrNull(pl.GetBiomeString()); } catch (Exception) { }
 
             string dir8 = Heading8();
             string line;
@@ -506,7 +537,7 @@ namespace SNMap
                     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg") files.Add(f);
                 }
                 files.Sort(StringComparer.Ordinal);
-                Dictionary<string, float[]> ini = ParseMapsIni(Path.Combine(mapsDir, "maps.ini"));
+                Dictionary<string, float[]> ini = Proto.ParseMapsIni(Path.Combine(mapsDir, "maps.ini"));
                 for (int i = 0; i < files.Count; i++)
                 {
                     MapLayer L = new MapLayer();
@@ -515,9 +546,8 @@ namespace SNMap
                     int us = L.Name.IndexOf('_');
                     if (us == 2 || us == 3)
                     {
-                        string head = L.Name.Substring(0, us);
                         int num;
-                        if (int.TryParse(head, out num)) L.Name = L.Name.Substring(us + 1);
+                        if (int.TryParse(L.Name.Substring(0, us), out num)) L.Name = L.Name.Substring(us + 1);
                     }
                     float[] b;
                     if (ini.TryGetValue(Path.GetFileName(files[i]), out b) && b.Length >= 4)
@@ -556,50 +586,16 @@ namespace SNMap
             }
         }
 
-        private static Dictionary<string, float[]> ParseMapsIni(string path)
-        {
-            Dictionary<string, float[]> res = new Dictionary<string, float[]>();
-            try
-            {
-                if (!File.Exists(path)) return res;
-                string[] lines = File.ReadAllLines(path);
-                for (int i = 0; i < lines.Length; i++)
-                {
-                    string line = lines[i].Trim();
-                    if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
-                    int eq = line.IndexOf('=');
-                    if (eq <= 0) continue;
-                    string name = line.Substring(0, eq).Trim();
-                    string[] parts = line.Substring(eq + 1).Split(new char[] { ',' });
-                    if (parts.Length < 4) continue;
-                    float[] b = new float[4];
-                    bool ok = true;
-                    for (int k = 0; k < 4; k++)
-                    {
-                        if (!float.TryParse(parts[k].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out b[k])) { ok = false; break; }
-                    }
-                    if (ok) res[name] = b;
-                }
-            }
-            catch (Exception) { }
-            return res;
-        }
-
         private MapLayer MinimapLayer()
         {
-            // 优先跟随大地图窗口选中的图层(窗口写索引), 未标定则回退到最近标定层
-            int wIdx = -1;
-            try { if (acc != null) wIdx = acc.ReadInt32(SharedState.OffWindowLayer); } catch (Exception) { }
+            // 优先跟随大地图窗口选中的图层; 未标定则回退到最近一个已标定层
+            int wIdx = windowLayer;
             if (wIdx >= 0 && wIdx < layers.Count && layers[wIdx].Calibrated) return layers[wIdx];
 
-            MapLayer cur = layers.Count > 0 ? layers[Mathf.Clamp(layerIdxHint, 0, layers.Count - 1)] : null;
-            if (cur != null && cur.Calibrated) return cur;
             for (int i = 0; i < layers.Count; i++)
                 if (layers[i].Calibrated) return layers[i];
-            return cur;
+            return layers.Count > 0 ? layers[0] : null;
         }
-
-        private int layerIdxHint;
 
         private Texture2D GetTex(MapLayer L)
         {
@@ -657,7 +653,7 @@ namespace SNMap
             float u0 = Mathf.Clamp(uc - su * 0.5f, 0f, 1f - su);
             float v0 = Mathf.Clamp(vc - sv * 0.5f, 0f, 1f - sv);
 
-            // 圆形小地图: 逐列切片绘制, 圆外完全透明(露出游戏画面), 无方形黑角
+            // 圆形小地图: 逐列切片绘制, 圆外完全透明(露出游戏画面)
             float cx = D * 0.5f, cy = D * 0.5f, R = D * 0.5f;
             int cols = (int)D;
             for (int c = 0; c < cols; c++)
@@ -758,15 +754,6 @@ namespace SNMap
             return Headings[Mathf.RoundToInt(HeadingAngle() / 45f) % 8];
         }
 
-        private static string MapBiome(string id)
-        {
-            if (string.IsNullOrEmpty(id)) return null;
-            string cn;
-            if (BiomeCn.TryGetValue(id, out cn)) return cn;
-            if (id.EndsWith("Cave") && BiomeCn.TryGetValue(id.Substring(0, id.Length - 4), out cn)) return cn + "洞穴";
-            return id;
-        }
-
         private void LoadFont()
         {
             string[] names = new string[] { "Microsoft YaHei UI", "Microsoft YaHei", "SimHei", "Arial" };
@@ -813,6 +800,17 @@ namespace SNMap
             return FallbackPingColors;
         }
 
+        private void LoadPingsApi()
+        {
+            try
+            {
+                pingsDictField = typeof(PingManager).GetField("pings", BindingFlags.NonPublic | BindingFlags.Static);
+                pingColorsField = typeof(PingManager).GetField("colorOptions", BindingFlags.Public | BindingFlags.Static);
+            }
+            catch (Exception) { }
+        }
+
+        // 黑-银-黑 金属描边圆环, 圆内外均透明
         private void BuildRingTexture(int D)
         {
             try
@@ -847,6 +845,7 @@ namespace SNMap
                         px[y * D + x] = col;
                     }
                 }
+                if (ringTex != null) UnityEngine.Object.Destroy(ringTex);
                 ringTex = new Texture2D(D, D, TextureFormat.RGBA32, false);
                 ringTex.SetPixels32(px);
                 ringTex.Apply();
@@ -931,16 +930,6 @@ namespace SNMap
             dotTex = new Texture2D(w, h, TextureFormat.RGBA32, false);
             dotTex.SetPixels32(px);
             dotTex.Apply();
-        }
-
-        private void LoadPingsApi()
-        {
-            try
-            {
-                pingsDictField = typeof(PingManager).GetField("pings", BindingFlags.NonPublic | BindingFlags.Static);
-                pingColorsField = typeof(PingManager).GetField("colorOptions", BindingFlags.Public | BindingFlags.Static);
-            }
-            catch (Exception) { }
         }
 
         private void EnsureStyles()
