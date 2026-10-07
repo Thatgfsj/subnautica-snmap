@@ -1,9 +1,10 @@
-/* SNMapBoot.dll v2 - injected into Subnautica (Unity Mono, x64)
- * Loads SNMapManaged.dll through the game's own mono runtime and calls
- * SNMap.Boot.InstallMain() ON the game main thread (Unity API requirement).
- * Strategy: hook WH_GETMESSAGE on every thread of this process; only the
- * thread owning the game's main window performs the install. Writes
- * step-by-step diagnostics to SNMapBoot.log next to this DLL.
+/* SNMapBoot.dll v3 - injected into Subnautica (Unity Mono, x64)
+ * Loads the newest SNMapManaged*.dll through the game's own mono runtime and
+ * calls SNMap.Boot.InstallMain() ON the game main thread (Unity API requirement).
+ * Strategy: hook WH_GETMESSAGE on every thread of this process; only the thread
+ * owning the game's main window performs the install. Diagnostics -> SNMapBoot.log.
+ * Exported SNMapTrigger() lets the injector re-run the worker at any time
+ * (hot update: drop a newer SNMapManaged*.dll in, trigger, done - no game restart).
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -23,8 +24,9 @@ static HMODULE g_self = NULL;
 static HMODULE g_mono = NULL;
 static HHOOK g_hooks[64];
 static int g_hookCount = 0;
-static volatile LONG g_state = 0;   /* 0=idle 1=armed 2=done */
+static volatile LONG g_state = 0;        /* 0=idle 1=armed 2=done 3=stopped */
 static volatile LONG g_anyThread = 0;
+static volatile LONG g_workerRunning = 0;
 static DWORD g_mainTid = 0;
 
 static void dlog(const char *fmt, ...)
@@ -63,39 +65,33 @@ static FARPROC mono_proc(const char *name)
     return g_mono ? GetProcAddress(g_mono, name) : NULL;
 }
 
-struct find_ctx { DWORD pid; DWORD tid; LONG area; };
-
-static BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lp)
+/* pick the newest SNMapManaged*.dll next to this dll */
+static int resolve_managed_path(wchar_t *out, DWORD outChars)
 {
-    struct find_ctx *ctx = (struct find_ctx *)lp;
-    DWORD pid = 0, tid;
-    RECT r;
-    LONG area;
-    if (!IsWindowVisible(hwnd)) return TRUE;
-    tid = GetWindowThreadProcessId(hwnd, &pid);
-    if (pid != ctx->pid || !tid) return TRUE;
-    area = 0;
-    if (GetWindowRect(hwnd, &r)) area = (LONG)(r.right - r.left) * (LONG)(r.bottom - r.top);
-    if (area >= ctx->area) { ctx->area = area; ctx->tid = tid; }
-    return TRUE;
-}
-
-static int enum_self_threads(DWORD *out, int max)
-{
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    DWORD pid = GetCurrentProcessId();
-    int count = 0;
-    THREADENTRY32 te;
-    if (snap == INVALID_HANDLE_VALUE) return 0;
-    te.dwSize = sizeof(te);
-    if (Thread32First(snap, &te)) {
-        do {
-            if (te.th32OwnerProcessID == pid && count < max)
-                out[count++] = te.th32ThreadID;
-        } while (Thread32Next(snap, &te));
+    wchar_t dir[MAX_PATH];
+    wchar_t pattern[MAX_PATH];
+    DWORD n = GetModuleFileNameW(g_self, dir, MAX_PATH);
+    if (!n || n >= MAX_PATH) return 0;
+    while (n > 0 && dir[n - 1] != L'\\') n--;
+    if (n == 0) return 0;
+    dir[n] = 0;
+    lstrcpyW(pattern, dir);
+    lstrcpyW(pattern + n, L"SNMapManaged*.dll");
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    FILETIME bestFt = fd.ftLastWriteTime;
+    lstrcpyW(out, dir);
+    lstrcpyW(out + n, fd.cFileName);
+    while (FindNextFileW(h, &fd)) {
+        if (CompareFileTime(&fd.ftLastWriteTime, &bestFt) > 0) {
+            bestFt = fd.ftLastWriteTime;
+            lstrcpyW(out, dir);
+            lstrcpyW(out + n, fd.cFileName);
+        }
     }
-    CloseHandle(snap);
-    return count;
+    FindClose(h);
+    return 1;
 }
 
 static void do_install(void)
@@ -110,7 +106,6 @@ static void do_install(void)
     void *domain, *assembly, *image, *cls, *method;
     wchar_t wpath[MAX_PATH];
     char path[MAX_PATH * 2];
-    DWORD n;
 
     get_root = (mono_get_root_domain_t)mono_proc("mono_get_root_domain");
     attach = (mono_thread_attach_t)mono_proc("mono_thread_attach");
@@ -125,11 +120,10 @@ static void do_install(void)
         return;
     }
 
-    n = GetModuleFileNameW(g_self, wpath, MAX_PATH);
-    if (!n || n >= MAX_PATH) return;
-    while (n > 0 && wpath[n - 1] != L'\\') n--;
-    if (n == 0) return;
-    lstrcpyW(wpath + n, L"SNMapManaged.dll");
+    if (!resolve_managed_path(wpath, MAX_PATH)) {
+        dlog("install: no SNMapManaged*.dll found");
+        return;
+    }
     WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, (int)sizeof(path), NULL, NULL);
 
     dlog("install: tid=%lu path=%s", (unsigned long)GetCurrentThreadId(), path);
@@ -166,21 +160,57 @@ static LRESULT CALLBACK hook_proc(int code, WPARAM wp, LPARAM lp)
     return CallNextHookEx(NULL, code, wp, lp);
 }
 
+struct find_ctx { DWORD pid; DWORD tid; LONG area; };
+
+static BOOL CALLBACK enum_proc(HWND hwnd, LPARAM lp)
+{
+    struct find_ctx *ctx = (struct find_ctx *)lp;
+    DWORD pid = 0, tid;
+    RECT r;
+    LONG area;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    tid = GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != ctx->pid || !tid) return TRUE;
+    area = 0;
+    if (GetWindowRect(hwnd, &r)) area = (LONG)(r.right - r.left) * (LONG)(r.bottom - r.top);
+    if (area >= ctx->area) { ctx->area = area; ctx->tid = tid; }
+    return TRUE;
+}
+
+static int enum_self_threads(DWORD *out, int max)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    DWORD pid = GetCurrentProcessId();
+    int count = 0;
+    THREADENTRY32 te;
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid && count < max)
+                out[count++] = te.th32ThreadID;
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return count;
+}
+
 static DWORD WINAPI worker(LPVOID arg)
 {
     DWORD tids[128];
     int n, i, tries;
 
     (void)arg;
+    InterlockedExchange(&g_state, 0);
+    InterlockedExchange(&g_anyThread, 0);
     dlog("worker start");
     for (tries = 0; tries < 600; tries++) {
         if (mono_proc("mono_get_root_domain")) break;
         Sleep(200);
     }
     dlog("mono=%s", g_mono ? "found" : "MISSING");
-    if (!g_mono) return 1;
+    if (!g_mono) { InterlockedExchange(&g_workerRunning, 0); return 1; }
 
-    /* main window thread = owner of the largest visible top-level window */
     {
         struct find_ctx ctx;
         ctx.pid = GetCurrentProcessId();
@@ -192,13 +222,14 @@ static DWORD WINAPI worker(LPVOID arg)
     dlog("main tid=%lu", (unsigned long)g_mainTid);
 
     n = enum_self_threads(tids, 128);
+    g_hookCount = 0;
     dlog("threads=%d", n);
     for (i = 0; i < n && g_hookCount < 64; i++) {
         HHOOK h = SetWindowsHookExW(WH_GETMESSAGE, hook_proc, g_self, tids[i]);
         if (h) g_hooks[g_hookCount++] = h;
     }
     dlog("hooks set=%d", g_hookCount);
-    if (g_hookCount == 0) return 2;
+    if (g_hookCount == 0) { InterlockedExchange(&g_workerRunning, 0); return 2; }
 
     InterlockedExchange(&g_state, 1);
     for (i = 0; i < 600 && g_state != 2; i++) Sleep(100);
@@ -209,7 +240,9 @@ static DWORD WINAPI worker(LPVOID arg)
     }
     InterlockedExchange(&g_state, 3); /* stop firing */
     for (i = 0; i < g_hookCount; i++) UnhookWindowsHookEx(g_hooks[i]);
+    g_hookCount = 0;
     dlog("worker done (installed=%d)", g_state == 2);
+    InterlockedExchange(&g_workerRunning, 0);
     return 0;
 }
 
@@ -219,7 +252,15 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
     if (reason == DLL_PROCESS_ATTACH) {
         g_self = hinst;
         DisableThreadLibraryCalls(hinst);
-        CreateThread(NULL, 0, worker, NULL, 0, NULL);
+        if (InterlockedCompareExchange(&g_workerRunning, 1, 0) == 0)
+            CreateThread(NULL, 0, worker, NULL, 0, NULL);
     }
     return TRUE;
+}
+
+/* exported: re-run the worker (injector calls this for hot updates) */
+__declspec(dllexport) void __stdcall SNMapTrigger(void)
+{
+    if (InterlockedCompareExchange(&g_workerRunning, 1, 0) != 0) return;
+    CreateThread(NULL, 0, worker, NULL, 0, NULL);
 }

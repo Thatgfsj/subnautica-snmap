@@ -1,7 +1,9 @@
-// SNMap 独立版 v1.1 (注入器/修改器方式, 无 BepInEx 依赖)
-// 左上角: 坐标文字 + 圆形小地图(F7 循环 关->200->300->500->关, 显示范围=世界米数)
-// F9: 全屏大地图 (自动解锁光标 + GameInput.ClearInput 屏蔽游戏输入, 滚轮缩放/拖动平移)
-// 底图: KT411 2024 中文标注图, 中心=(0,0), 四边=±WorldRange, 上=北(-Z), 右=东(+X)
+// SNMap 独立版 v1.2 (注入器/修改器方式, 无 BepInEx 依赖)
+// 左上角: 坐标文字 + 圆形小地图(F7 循环 关->200->300->500->关), 与大地图当前图层同步
+// F9: 全屏大地图, 顶部 [－][＋] 切换 maps/ 文件夹里的图层, 解锁光标+屏蔽游戏输入, 滚轮缩放/拖动平移
+// 朝向: 使用渲染相机 MainCamera.camera (Player.main.transform 不随视角旋转!)
+// 底图: maps/ 文件夹下所有 png/jpg, 命名序号决定顺序; maps.ini 可选每层标定: 文件名=minX,maxX,minZ,maxZ
+//       默认标定: 中心=(0,0), 四边=±WorldRange; 未标定的非方形图层仅浏览(不画玩家/信标)
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -20,10 +22,11 @@ namespace SNMap
             try
             {
                 Cfg.Init();
-                if (GameObject.Find("SNMapRoot") != null)
+                GameObject old = GameObject.Find("SNMapRoot");
+                if (old != null)
                 {
-                    Cfg.Log("already installed, skip");
-                    return;
+                    Cfg.Log("existing install found - replacing (hot update)");
+                    UnityEngine.Object.Destroy(old);
                 }
                 GameObject go = new GameObject("SNMapRoot");
                 UnityEngine.Object.DontDestroyOnLoad(go);
@@ -106,7 +109,7 @@ namespace SNMap
                             }
                     }
                 }
-                Log("config loaded: key=" + ToggleMapKey + " minimap=" + MinimapPixels + "px spans=" + MinimapSpans.Length);
+                Log("config loaded: key=" + ToggleMapKey + " minimap=" + MinimapPixels + "px");
             }
             catch (Exception ex)
             {
@@ -126,9 +129,20 @@ namespace SNMap
         }
     }
 
+    internal class MapLayer
+    {
+        public string Name;
+        public string Path;
+        public Texture2D Tex;
+        public int Width;
+        public int Height;
+        public float MinX = -2000f, MaxX = 2000f, MinZ = -2000f, MaxZ = 2000f;
+        public bool Calibrated = true;   // false = 仅浏览(不画玩家/信标, 小地图不跟随)
+        public bool HasIniBounds;
+    }
+
     public class SnMapBehaviour : MonoBehaviour
     {
-        private Texture2D mapTex;
         private Texture2D arrowTex;
         private Texture2D dotTex;
         private Texture2D panelTex;
@@ -138,10 +152,13 @@ namespace SNMap
         private GUIStyle hudStyle;
         private GUIStyle smallStyle;
         private GUIStyle btnStyle;
+        private GUIStyle bigBtnStyle;
         private bool mapOpen;
-        private int minimapIdx;           // 0=关, 1..N=MinimapSpans 档位
-        private Rect mapSq;               // 全屏大地图中正方形底图区域
-        private float zoom = 1f;          // 1..16
+        private int minimapIdx = 1;       // 0=关, 1..N=MinimapSpans 档位, 默认开第1档
+        private List<MapLayer> layers = new List<MapLayer>();
+        private int layerIdx;
+        private int lastCalIdx;
+        private float zoom = 1f;
         private float centerU = 0.5f;
         private float centerV = 0.5f;
         private CursorLockMode prevLock = CursorLockMode.None;
@@ -196,26 +213,25 @@ namespace SNMap
             BuildDotTexture();
             BuildPanelTexture();
             BuildCircleMask(Cfg.MinimapPixels);
-            LoadMapTexture();
-            try
-            {
-                pingsDictField = typeof(PingManager).GetField("pings", BindingFlags.NonPublic | BindingFlags.Static);
-                pingColorsField = typeof(PingManager).GetField("colorOptions", BindingFlags.Public | BindingFlags.Static);
-            }
-            catch (Exception) { }
+            LoadLayers();
+            LoadPingsApi();
 
-            Cfg.Log("SNMap 1.1 behaviour awake ok | map=" + (mapTex != null) + " cjk=" + uiFontCjk +
-                    " pings=" + (pingsDictField != null) + " bigKey=" + Cfg.ToggleMapKey +
-                    " miniKey=" + Cfg.ToggleHudKey);
+            if (layers.Count > 0)
+            {
+                GetTex(layers[0]);
+                Cfg.Log("SNMap 1.2 awake | layers=" + layers.Count +
+                        " cjk=" + uiFontCjk + " pings=" + (pingsDictField != null) +
+                        " bigKey=" + Cfg.ToggleMapKey + " miniKey=" + Cfg.ToggleHudKey);
+            }
+            else
+            {
+                Cfg.Log("SNMap 1.2 awake | NO map layers found!");
+            }
         }
 
         private void OnDestroy()
         {
-            try
-            {
-                if (mapOpen) RestoreCursor();
-            }
-            catch (Exception) { }
+            try { if (mapOpen) RestoreCursor(); } catch (Exception) { }
         }
 
         private void Update()
@@ -228,11 +244,13 @@ namespace SNMap
             }
             if (Enum.TryParse(Cfg.ToggleHudKey, true, out kc) && Input.GetKeyDown(kc))
             {
-                minimapIdx = (minimapIdx + 1) % (Cfg.MinimapSpans.Length + 1); // 关->1->2->3->关
+                minimapIdx = (minimapIdx + 1) % (Cfg.MinimapSpans.Length + 1);
             }
             if (mapOpen)
             {
-                try { GameInput.ClearInput(2); } catch (Exception) { } // 屏蔽移动/视角/按键
+                try { GameInput.ClearInput(2); } catch (Exception) { }
+                // 游戏每帧都会重新锁鼠标, 必须每帧抢回来
+                try { Cursor.lockState = CursorLockMode.None; Cursor.visible = true; } catch (Exception) { }
             }
         }
 
@@ -266,8 +284,13 @@ namespace SNMap
             if (pl == null || pl.transform == null) return;
             EnsureStyles();
 
-            Transform tr = pl.transform;
-            Vector3 pos = tr.position;
+            if (mapOpen)
+            {
+                // OnGUI 每帧多次, 再抢一次鼠标, 确保渲染前状态正确
+                try { Cursor.lockState = CursorLockMode.None; Cursor.visible = true; } catch (Exception) { }
+            }
+
+            Vector3 pos = pl.transform.position;
             float depth = -pos.y;
             try { depth = pl.GetDepth(); } catch (Exception) { }
             string biome = null;
@@ -275,7 +298,7 @@ namespace SNMap
 
             if (!mapOpen)
             {
-                string dir8 = Heading8(tr);
+                string dir8 = Heading8();
                 string line;
                 if (uiFontCjk)
                 {
@@ -291,46 +314,211 @@ namespace SNMap
                 }
                 LabelShadowed(new Rect(16, 12, 1200, 60), line, hudStyle);
 
-                if (minimapIdx > 0 && mapTex != null)
-                    DrawMinimap(pl, tr);
+                if (minimapIdx > 0)
+                {
+                    MapLayer ml = MinimapLayer();
+                    if (ml != null && GetTex(ml) != null)
+                        DrawMinimap(pl, ml);
+                }
             }
 
             if (mapOpen)
                 DrawBigMap(pl);
         }
 
+        // ------------------------------------------------------------- layers
+
+        private void LoadLayers()
+        {
+            layers.Clear();
+            string dir = null;
+            try { dir = Path.GetDirectoryName(typeof(SnMapBehaviour).Assembly.Location); } catch (Exception) { }
+            string mapsDir = dir != null ? Path.Combine(dir, "maps") : null;
+
+            if (mapsDir != null && Directory.Exists(mapsDir))
+            {
+                List<string> files = new List<string>();
+                foreach (string f in Directory.GetFiles(mapsDir))
+                {
+                    string ext = Path.GetExtension(f).ToLowerInvariant();
+                    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg") files.Add(f);
+                }
+                files.Sort(StringComparer.Ordinal);
+                Dictionary<string, float[]> ini = ParseMapsIni(Path.Combine(mapsDir, "maps.ini"));
+                for (int i = 0; i < files.Count; i++)
+                {
+                    MapLayer L = new MapLayer();
+                    L.Path = files[i];
+                    L.Name = Path.GetFileNameWithoutExtension(files[i]);
+                    int us = L.Name.IndexOf('_');
+                    if (us == 2 || us == 3)
+                    {
+                        string head = L.Name.Substring(0, us);
+                        int num;
+                        if (int.TryParse(head, out num)) L.Name = L.Name.Substring(us + 1);
+                    }
+                    float[] b;
+                    if (ini.TryGetValue(Path.GetFileName(files[i]), out b) && b.Length >= 4)
+                    {
+                        L.MinX = b[0]; L.MaxX = b[1]; L.MinZ = b[2]; L.MaxZ = b[3];
+                        L.HasIniBounds = true;
+                        L.Calibrated = true;
+                    }
+                    else
+                    {
+                        L.MinX = -Cfg.WorldRange; L.MaxX = Cfg.WorldRange;
+                        L.MinZ = -Cfg.WorldRange; L.MaxZ = Cfg.WorldRange;
+                    }
+                    layers.Add(L);
+                }
+            }
+
+            if (layers.Count == 0)
+            {
+                // 兼容旧的 map.png
+                string[] legacy = new string[]
+                {
+                    dir != null ? Path.Combine(dir, "map.png") : null,
+                    dir != null ? Path.Combine(dir, "map.jpg") : null
+                };
+                for (int i = 0; i < legacy.Length; i++)
+                {
+                    if (legacy[i] != null && File.Exists(legacy[i]))
+                    {
+                        MapLayer L = new MapLayer();
+                        L.Path = legacy[i];
+                        L.Name = uiFontCjk ? "主地图" : "map";
+                        layers.Add(L);
+                        break;
+                    }
+                }
+            }
+        }
+
+        private static Dictionary<string, float[]> ParseMapsIni(string path)
+        {
+            Dictionary<string, float[]> res = new Dictionary<string, float[]>();
+            try
+            {
+                if (!File.Exists(path)) return res;
+                string[] lines = File.ReadAllLines(path);
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string line = lines[i].Trim();
+                    if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    string name = line.Substring(0, eq).Trim();
+                    string[] parts = line.Substring(eq + 1).Split(new char[] { ',' });
+                    if (parts.Length < 4) continue;
+                    float[] b = new float[4];
+                    bool ok = true;
+                    for (int k = 0; k < 4; k++)
+                    {
+                        if (!float.TryParse(parts[k].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out b[k])) { ok = false; break; }
+                    }
+                    if (ok) res[name] = b;
+                }
+            }
+            catch (Exception) { }
+            return res;
+        }
+
+        private MapLayer CurrentLayer()
+        {
+            if (layers.Count == 0) return null;
+            return layers[Mathf.Clamp(layerIdx, 0, layers.Count - 1)];
+        }
+
+        private MapLayer MinimapLayer()
+        {
+            MapLayer cur = CurrentLayer();
+            if (cur != null && cur.Calibrated && cur.Tex != null) return cur;
+            if (lastCalIdx >= 0 && lastCalIdx < layers.Count) return layers[lastCalIdx];
+            return cur;
+        }
+
+        private Texture2D GetTex(MapLayer L)
+        {
+            if (L == null) return null;
+            if (L.Tex != null) return L.Tex;
+            try
+            {
+                if (!File.Exists(L.Path)) return null;
+                byte[] raw = File.ReadAllBytes(L.Path);
+                Texture2D tex = new Texture2D(4, 4, TextureFormat.RGBA32, false);
+                tex.wrapMode = TextureWrapMode.Clamp;
+                if (!tex.LoadImage(raw))
+                {
+                    UnityEngine.Object.Destroy(tex);
+                    return null;
+                }
+                L.Tex = tex;
+                L.Width = tex.width;
+                L.Height = tex.height;
+                if (!L.HasIniBounds)
+                {
+                    float ar = L.Height > 0 ? (float)L.Width / L.Height : 1f;
+                    L.Calibrated = ar > 0.9f && ar < 1.1f;   // 方形视为全图投影
+                }
+                // 释放其他图层纹理, 控制显存(大图 8192^2 有 256MB)
+                for (int i = 0; i < layers.Count; i++)
+                {
+                    if (layers[i] != L && layers[i].Tex != null)
+                    {
+                        UnityEngine.Object.Destroy(layers[i].Tex);
+                        layers[i].Tex = null;
+                    }
+                }
+                if (L.Calibrated) lastCalIdx = layers.IndexOf(L);
+                return tex;
+            }
+            catch (Exception ex)
+            {
+                Cfg.Log("load layer failed: " + L.Name + " (" + ex.Message + ")");
+                return null;
+            }
+        }
+
+        private void SwitchLayer(int delta)
+        {
+            if (layers.Count == 0) return;
+            layerIdx = (layerIdx + delta + layers.Count) % layers.Count;
+            GetTex(layers[layerIdx]);
+        }
+
         // ------------------------------------------------------------- minimap
 
-        private void DrawMinimap(Player pl, Transform tr)
+        private void DrawMinimap(Player pl, MapLayer L)
         {
             float D = Mathf.Min(Cfg.MinimapPixels, Screen.height - 80f);
             Rect sq = new Rect(16f, 48f, D, D);
             float spanWorld = Cfg.MinimapSpans[Mathf.Clamp(minimapIdx - 1, 0, Cfg.MinimapSpans.Length - 1)];
-            float spanUV = spanWorld / (2f * Cfg.WorldRange);
+            float su = spanWorld / (L.MaxX - L.MinX);
+            float sv = spanWorld / (L.MaxZ - L.MinZ);
 
             Vector3 p = pl.transform.position;
-            float uc = (p.x + Cfg.WorldRange) / (2f * Cfg.WorldRange);
-            float vc = (p.z + Cfg.WorldRange) / (2f * Cfg.WorldRange);
-            float u0 = Mathf.Clamp(uc - spanUV * 0.5f, 0f, 1f - spanUV);
-            float v0 = Mathf.Clamp(vc - spanUV * 0.5f, 0f, 1f - spanUV);
-            Rect uvRect = new Rect(u0, 1f - (v0 + spanUV), spanUV, spanUV);
+            float uc = (p.x - L.MinX) / (L.MaxX - L.MinX);
+            float vc = (p.z - L.MinZ) / (L.MaxZ - L.MinZ);
+            float u0 = Mathf.Clamp(uc - su * 0.5f, 0f, 1f - su);
+            float v0 = Mathf.Clamp(vc - sv * 0.5f, 0f, 1f - sv);
+            Rect uvRect = new Rect(u0, 1f - (v0 + sv), su, sv);
 
-            GUI.DrawTextureWithTexCoords(sq, mapTex, uvRect, false);
+            GUI.DrawTextureWithTexCoords(sq, L.Tex, uvRect, false);
             if (circleMask != null) GUI.DrawTexture(sq, circleMask);
 
-            // 信标点
             Color[] colors = GetPingColors();
             List<PingInstance> list = GetPings();
             if (list != null)
             {
-                float half = spanWorld * 0.5f;
+                float halfX = spanWorld * 0.5f, halfZ = spanWorld * 0.5f;
                 for (int i = 0; i < list.Count; i++)
                 {
                     PingInstance pi = list[i];
                     if (pi == null || !pi.visible) continue;
                     Vector3 q = pi.GetPosition();
                     float dx = q.x - p.x, dz = q.z - p.z;
-                    if (Mathf.Abs(dx) > half || Mathf.Abs(dz) > half) continue;
+                    if (Mathf.Abs(dx) > halfX || Mathf.Abs(dz) > halfZ) continue;
                     float sx = sq.x + (0.5f + dx / spanWorld) * D;
                     float sy = sq.y + (0.5f + dz / spanWorld) * D;
                     if (Vector2.Distance(new Vector2(sx, sy), sq.center) > D * 0.5f - 8f) continue;
@@ -341,16 +529,16 @@ namespace SNMap
                 }
             }
 
-            // 玩家箭头(朝向)
-            float ang = HeadingAngle(tr);
+            float ang = HeadingAngle();
             Matrix4x4 old = GUI.matrix;
             GUIUtility.RotateAroundPivot(ang, sq.center);
             GUI.DrawTexture(new Rect(sq.center.x - 13f, sq.center.y - 13f, 26f, 26f), arrowTex);
             GUI.matrix = old;
 
             LabelShadowed(new Rect(sq.center.x - 20f, sq.y + 4f, 40f, 20f), "N", smallStyle);
-            LabelShadowed(new Rect(sq.x, sq.yMax + 2f, 260f, 22f),
-                string.Format(uiFontCjk ? "范围 {0:F0}m  [{1}切换]" : "range {0:F0}m  [{1}]", spanWorld, Cfg.ToggleHudKey),
+            LabelShadowed(new Rect(sq.x, sq.yMax + 2f, 320f, 22f),
+                string.Format(uiFontCjk ? "{0}  范围 {1:F0}m  [{2}切换]" : "{0}  range {1:F0}m  [{2}]",
+                    L.Name, spanWorld, Cfg.ToggleHudKey),
                 smallStyle);
         }
 
@@ -361,31 +549,68 @@ namespace SNMap
             Rect full = new Rect(0f, 0f, Screen.width, Screen.height);
             GUI.DrawTexture(full, panelTex);
 
-            if (mapTex == null)
+            MapLayer L = CurrentLayer();
+            if (L == null)
             {
-                GUI.Label(new Rect(20f, 20f, 600f, 40f), "map.png not found", hudStyle);
+                GUI.Label(new Rect(20f, 60f, 600f, 40f), "maps 文件夹里没有地图", hudStyle);
+                DrawCloseButton();
+                return;
+            }
+            Texture2D tex = GetTex(L);
+            if (tex == null)
+            {
+                GUI.Label(new Rect(20f, 60f, 700f, 40f), "图层加载失败: " + L.Name, hudStyle);
                 DrawCloseButton();
                 return;
             }
 
-            float side = Mathf.Min(Screen.width, Screen.height);
-            mapSq = new Rect((Screen.width - side) * 0.5f, (Screen.height - side) * 0.5f, side, side);
+            // 顶部图层切换条: [－] 名称 (i/N) [＋]
+            float barW = 520f;
+            float barX = (Screen.width - barW) * 0.5f;
+            bool repaint = Event.current != null && Event.current.type == EventType.Repaint;
+            Rect prevR = new Rect(barX, 10f, 56f, 32f);
+            Rect nextR = new Rect(barX + barW - 56f, 10f, 56f, 32f);
+            if (repaint && GUI.Button(prevR, "－", bigBtnStyle)) SwitchLayer(-1);
+            if (repaint && GUI.Button(nextR, "＋", bigBtnStyle)) SwitchLayer(1);
+            LabelShadowed(new Rect(barX + 66f, 14f, barW - 132f, 28f),
+                string.Format("{0}   ({1}/{2}){3}", L.Name, layerIdx + 1, layers.Count,
+                    L.Calibrated ? "" : (uiFontCjk ? "  [未标定·仅浏览]" : "  [browse only]")),
+                hudStyle);
 
-            HandleBigMapInput(mapSq);
-            float span = 1f / zoom;
-            float u0 = Mathf.Clamp(centerU - span * 0.5f, 0f, 1f - span);
-            float v0 = Mathf.Clamp(centerV - span * 0.5f, 0f, 1f - span);
-            Rect uvRect = new Rect(u0, 1f - (v0 + span), span, span);
-            GUI.DrawTextureWithTexCoords(mapSq, mapTex, uvRect, true);
+            // 地图绘制区
+            float availW = Screen.width - 16f;
+            float availH = Screen.height - 60f;
+            float side = Mathf.Min(availW, availH);
+            float ar = L.Height > 0 ? (float)L.Width / L.Height : 1f;
+            float drawW = side, drawH = side;
+            if (ar >= 1f) drawH = side / ar; else drawW = side * ar;
+            Rect sq = new Rect((Screen.width - drawW) * 0.5f, 48f + (availH - drawH) * 0.5f, drawW, drawH);
 
-            DrawPings(mapSq, u0, v0, span, true);
-            DrawPlayer(mapSq, u0, v0, span);
+            HandleBigMapInput(sq);
+            float spanU = 1f / zoom, spanV = 1f / zoom;
+            centerU = Mathf.Clamp(centerU, spanU * 0.5f, 1f - spanU * 0.5f);
+            centerV = Mathf.Clamp(centerV, spanV * 0.5f, 1f - spanV * 0.5f);
+            Rect uvRect = new Rect(centerU - spanU * 0.5f, 1f - (centerV + spanV * 0.5f), spanU, spanV);
+            GUI.DrawTextureWithTexCoords(sq, tex, uvRect, true);
 
-            float pxPerM = side / (span * 2f * Cfg.WorldRange);
-            if (pxPerM > 0f)
+            if (L.Calibrated)
             {
-                LabelShadowed(new Rect(mapSq.x + 10f, mapSq.y + 8f, 320f, 26f),
-                    string.Format(uiFontCjk ? "比例 1px = {0:F2}m (x{1:F1})" : "scale 1px = {0:F2}m (x{1:F1})", 1f / pxPerM, zoom),
+                float u0 = centerU - spanU * 0.5f, v0 = centerV - spanV * 0.5f;
+                DrawPings(L, sq, u0, v0, spanU, spanV);
+                DrawPlayer(L, pl, sq, u0, v0, spanU, spanV);
+                float mPerPx = (L.MaxX - L.MinX) / (sq.width * spanU);
+                if (mPerPx > 0f)
+                {
+                    LabelShadowed(new Rect(sq.x + 10f, sq.y + 8f, 340f, 26f),
+                        string.Format(uiFontCjk ? "比例 1px = {0:F2}m (x{1:F1})" : "scale 1px = {0:F2}m (x{1:F1})", mPerPx, zoom),
+                        smallStyle);
+                }
+            }
+            else
+            {
+                LabelShadowed(new Rect(sq.x + 10f, sq.y + 8f, 560f, 26f),
+                    uiFontCjk ? "该图层未标定世界坐标, 仅浏览 (玩家/信标不显示)"
+                              : "layer not calibrated - view only",
                     smallStyle);
             }
 
@@ -396,7 +621,7 @@ namespace SNMap
             LabelShadowed(new Rect(14f, Screen.height - 34f, 700f, 26f),
                 string.Format(uiFontCjk ? "X {0:F0}   Z {1:F0}   深度 {2:F0}m" : "X {0:F0}   Z {1:F0}   Depth {2:F0}m", p.x, p.z, depth),
                 smallStyle);
-            LabelShadowed(new Rect(14f, 10f, 700f, 26f),
+            LabelShadowed(new Rect(14f, 52f, 700f, 26f),
                 uiFontCjk ? "[" + Cfg.ToggleMapKey + " 关闭]  滚轮缩放  左键拖动平移"
                           : "[" + Cfg.ToggleMapKey + " close]  wheel=zoom  drag=pan",
                 smallStyle);
@@ -418,52 +643,42 @@ namespace SNMap
         {
             Event e = Event.current;
             if (e == null) return;
-            float span = 1f / zoom;
-            float u0 = Mathf.Clamp(centerU - span * 0.5f, 0f, 1f - span);
-            float v0 = Mathf.Clamp(centerV - span * 0.5f, 0f, 1f - span);
+            float spanU = 1f / zoom, spanV = 1f / zoom;
+            float u0 = centerU - spanU * 0.5f, v0 = centerV - spanV * 0.5f;
 
             if (e.type == EventType.ScrollWheel && sq.Contains(e.mousePosition))
             {
-                float mu = u0 + (e.mousePosition.x - sq.x) / sq.width * span;
-                float mv = v0 + (e.mousePosition.y - sq.y) / sq.height * span;
+                float mu = u0 + (e.mousePosition.x - sq.x) / sq.width * spanU;
+                float mv = v0 + (e.mousePosition.y - sq.y) / sq.height * spanV;
                 float oldZoom = zoom;
                 zoom = Mathf.Clamp(zoom * (e.delta.y > 0f ? 1.25f : 0.8f), 1f, 16f);
                 if (zoom != oldZoom)
                 {
-                    float newSpan = 1f / zoom;
-                    centerU = mu + (centerU - mu) * (newSpan / span);
-                    centerV = mv + (centerV - mv) * (newSpan / span);
-                    ClampCenter(newSpan);
+                    float nu = 1f / zoom, nv = 1f / zoom;
+                    centerU = mu + (centerU - mu) * (nu / spanU);
+                    centerV = mv + (centerV - mv) * (nv / spanV);
                 }
                 e.Use();
             }
             else if (e.type == EventType.MouseDrag && e.button == 0 &&
                      zoom > 1f && sq.Contains(e.mousePosition))
             {
-                centerU -= e.delta.x / sq.width * span;
-                centerV -= e.delta.y / sq.height * span;
-                ClampCenter(span);
+                centerU -= e.delta.x / sq.width * spanU;
+                centerV -= e.delta.y / sq.height * spanV;
                 e.Use();
             }
         }
 
-        private void ClampCenter(float span)
-        {
-            centerU = Mathf.Clamp(centerU, span * 0.5f, 1f - span * 0.5f);
-            centerV = Mathf.Clamp(centerV, span * 0.5f, 1f - span * 0.5f);
-        }
-
         // ------------------------------------------------------------- shared draw
 
-        private void DrawPlayer(Rect sq, float u0, float v0, float span)
+        private void DrawPlayer(MapLayer L, Player pl, Rect sq, float u0, float v0, float spanU, float spanV)
         {
-            Player pl = Player.main;
             if (pl == null || arrowTex == null) return;
             Vector3 p = pl.transform.position;
             float mx, my;
-            if (!WorldToWindow(p.x, p.z, sq, u0, v0, span, out mx, out my)) return;
+            if (!WorldToWindow(L, p.x, p.z, sq, u0, v0, spanU, spanV, out mx, out my)) return;
 
-            float ang = HeadingAngle(pl.transform);
+            float ang = HeadingAngle();
             float a = 34f;
             Matrix4x4 old = GUI.matrix;
             GUIUtility.RotateAroundPivot(ang, new Vector2(mx, my));
@@ -471,7 +686,7 @@ namespace SNMap
             GUI.matrix = old;
         }
 
-        private void DrawPings(Rect sq, float u0, float v0, float span, bool withLabels)
+        private void DrawPings(MapLayer L, Rect sq, float u0, float v0, float spanU, float spanV)
         {
             if (dotTex == null) return;
             try
@@ -485,19 +700,16 @@ namespace SNMap
                     if (pi == null || !pi.visible) continue;
                     Vector3 p = pi.GetPosition();
                     float mx, my;
-                    if (!WorldToWindow(p.x, p.z, sq, u0, v0, span, out mx, out my)) continue;
+                    if (!WorldToWindow(L, p.x, p.z, sq, u0, v0, spanU, spanV, out mx, out my)) continue;
 
                     int ci = pi.colorIndex >= 0 ? pi.colorIndex : 0;
                     GUI.color = colors[ci % colors.Length];
                     GUI.DrawTexture(new Rect(mx - 7f, my - 7f, 14f, 14f), dotTex);
                     GUI.color = Color.white;
 
-                    if (withLabels)
-                    {
-                        string lbl = pi.GetLabel();
-                        if (!string.IsNullOrEmpty(lbl))
-                            LabelShadowed(new Rect(mx + 9f, my - 10f, 240f, 20f), lbl, smallStyle);
-                    }
+                    string lbl = pi.GetLabel();
+                    if (!string.IsNullOrEmpty(lbl))
+                        LabelShadowed(new Rect(mx + 9f, my - 10f, 240f, 20f), lbl, smallStyle);
                 }
             }
             catch (Exception ex)
@@ -542,13 +754,22 @@ namespace SNMap
             return FallbackPingColors;
         }
 
-        private bool WorldToWindow(float wx, float wz, Rect sq, float u0, float v0, float span, out float mx, out float my)
+        private void LoadPingsApi()
         {
-            float R = Cfg.WorldRange;
-            float u = (wx + R) / (2f * R);
-            float v = (wz + R) / (2f * R);
-            mx = sq.x + (u - u0) / span * sq.width;
-            my = sq.y + (v - v0) / span * sq.height;
+            try
+            {
+                pingsDictField = typeof(PingManager).GetField("pings", BindingFlags.NonPublic | BindingFlags.Static);
+                pingColorsField = typeof(PingManager).GetField("colorOptions", BindingFlags.Public | BindingFlags.Static);
+            }
+            catch (Exception) { }
+        }
+
+        private bool WorldToWindow(MapLayer L, float wx, float wz, Rect sq, float u0, float v0, float spanU, float spanV, out float mx, out float my)
+        {
+            float u = (wx - L.MinX) / (L.MaxX - L.MinX);
+            float v = (wz - L.MinZ) / (L.MaxZ - L.MinZ);
+            mx = sq.x + (u - u0) / spanU * sq.width;
+            my = sq.y + (v - v0) / spanV * sq.height;
             return mx >= sq.x - 24f && my >= sq.y - 24f && mx <= sq.xMax + 24f && my <= sq.yMax + 24f;
         }
 
@@ -563,19 +784,26 @@ namespace SNMap
             GUI.Label(rect, text, style);
         }
 
-        private static float HeadingAngle(Transform tr)
+        // 朝向: 用渲染相机 (Player.main.transform 不随视角旋转!)
+        private static float HeadingAngle()
         {
-            Vector3 f = tr.forward;
-            float a = 0f;
-            if (f.sqrMagnitude > 0.000001f) a = Mathf.Atan2(f.x, -f.z) * Mathf.Rad2Deg + 180f;
+            Vector3 f = Vector3.zero;
+            try
+            {
+                Camera cam = MainCamera.camera;
+                if (cam != null && cam.transform != null) f = cam.transform.forward;
+            }
+            catch (Exception) { }
+            if (f.sqrMagnitude < 0.000001f) return 0f;
+            float a = Mathf.Atan2(f.x, -f.z) * Mathf.Rad2Deg;
             if (a < 0f) a += 360f;
             if (a >= 360f) a -= 360f;
             return a;
         }
 
-        private static string Heading8(Transform tr)
+        private static string Heading8()
         {
-            return Headings[Mathf.RoundToInt(HeadingAngle(tr) / 45f) % 8];
+            return Headings[Mathf.RoundToInt(HeadingAngle() / 45f) % 8];
         }
 
         private static string MapBiome(string id)
@@ -599,42 +827,6 @@ namespace SNMap
                     return;
                 }
             }
-        }
-
-        private void LoadMapTexture()
-        {
-            string dir = null;
-            try { dir = Path.GetDirectoryName(typeof(SnMapBehaviour).Assembly.Location); } catch (Exception) { }
-
-            string[] cands = new string[]
-            {
-                dir != null ? Path.Combine(dir, "map.png") : null,
-                dir != null ? Path.Combine(dir, "map.jpg") : null
-            };
-
-            for (int i = 0; i < cands.Length; i++)
-            {
-                string path = cands[i];
-                if (path == null || !File.Exists(path)) continue;
-                try
-                {
-                    byte[] raw = File.ReadAllBytes(path);
-                    Texture2D tex = new Texture2D(4, 4, TextureFormat.RGBA32, false);
-                    tex.wrapMode = TextureWrapMode.Clamp;
-                    if (tex.LoadImage(raw))
-                    {
-                        mapTex = tex;
-                        Cfg.Log("map texture loaded: " + path + " (" + tex.width + "x" + tex.height + ")");
-                        return;
-                    }
-                    Cfg.Log("LoadImage failed: " + path);
-                }
-                catch (Exception ex)
-                {
-                    Cfg.Log("read map failed: " + path + " (" + ex.Message + ")");
-                }
-            }
-            Cfg.Log("map image not found next to SNMapManaged.dll");
         }
 
         private void BuildCircleMask(int D)
@@ -751,6 +943,10 @@ namespace SNMap
             btnStyle = new GUIStyle(GUI.skin.button);
             if (uiFont != null) btnStyle.font = uiFont;
             btnStyle.fontSize = 14;
+
+            bigBtnStyle = new GUIStyle(btnStyle);
+            bigBtnStyle.fontSize = Mathf.Max(16, Cfg.FontSize);
+            bigBtnStyle.alignment = TextAnchor.MiddleCenter;
         }
     }
 }

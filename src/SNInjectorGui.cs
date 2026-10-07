@@ -1,6 +1,5 @@
-// SNInjectorGui - 深海迷航小地图注入器 (图形界面版)
-// 运行后: 自动检测 Subnautica 进程 -> 选中(或点[选择窗口]手动选) -> 点[注入]
-// 注入成功后游戏内: F9=全屏大地图  F7=圆形小地图(200/300/500循环)
+// SNInjectorGui - 深海迷航小地图注入器 (蓝色主题, 检测到游戏自动注入)
+// 自动: 按进程名找 Subnautica -> 自动注入; 找不到时可[选择窗口]手动选 -> 点[注入]兜底
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -39,6 +38,12 @@ internal class WinEntry
 
 public class MainForm : Form
 {
+    private static readonly Color ThemeBg = Color.FromArgb(232, 241, 252);
+    private static readonly Color ThemeAccent = Color.FromArgb(25, 118, 210);
+    private static readonly Color ThemeAccentDark = Color.FromArgb(13, 71, 161);
+    private static readonly Color ThemeHover = Color.FromArgb(30, 136, 229);
+    private static readonly Color ThemeText = Color.FromArgb(21, 60, 100);
+
     private ListBox listBox;
     private Button btnRefresh;
     private Button btnPick;
@@ -49,60 +54,78 @@ public class MainForm : Form
     private string selectedDesc = "";
     private bool busy;
     private bool suppressSel;
+    private bool userPicked;
+    private int lastAutoPid = -1;
+    private int successPid = -1;
 
     public MainForm()
     {
-        Text = "深海迷航小地图注入器";
+        Text = "深海迷航小地图注入器 SNMap";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(470, 384);
+        ClientSize = new Size(480, 400);
+        BackColor = ThemeBg;
+
+        Label title = new Label();
+        title.Text = "SNMap · 深海迷航小地图";
+        title.Font = new Font("Microsoft YaHei UI", 14f, FontStyle.Bold);
+        title.ForeColor = ThemeAccentDark;
+        title.Location = new Point(14, 10);
+        title.AutoSize = true;
+        Controls.Add(title);
 
         Label hint = new Label();
-        hint.Text = "① 启动游戏   ② 选中游戏进程(检测不到就点[选择窗口])   ③ 点[注入]";
-        hint.Location = new Point(12, 12);
+        hint.Text = "启动游戏后会自动注入。检测不到时可[选择窗口]手动选，再点[注入]。";
+        hint.ForeColor = ThemeText;
+        hint.Location = new Point(16, 44);
         hint.AutoSize = true;
         Controls.Add(hint);
 
         listBox = new ListBox();
-        listBox.Location = new Point(12, 36);
-        listBox.Size = new Size(446, 196);
+        listBox.Location = new Point(14, 70);
+        listBox.Size = new Size(452, 198);
         listBox.SelectedIndexChanged += OnListSel;
-        listBox.DoubleClick += delegate { DoInject(); };
+        listBox.DoubleClick += delegate { ManualInject(); };
         Controls.Add(listBox);
 
-        btnRefresh = NewBtn("刷新进程", 12, 244, 110);
+        btnRefresh = BlueBtn("刷新进程", 14, 276, 108, ThemeAccent);
         btnRefresh.Click += delegate { RefreshList(); };
         Controls.Add(btnRefresh);
 
-        btnPick = NewBtn("选择窗口...", 130, 244, 110);
+        btnPick = BlueBtn("选择窗口...", 130, 276, 108, ThemeAccent);
         btnPick.Click += delegate { PickWindow(); };
         Controls.Add(btnPick);
 
-        btnInject = NewBtn("注  入", 348, 238, 110);
-        btnInject.Font = new Font(Font.FontFamily, 12f, FontStyle.Bold);
-        btnInject.BackColor = Color.FromArgb(225, 240, 255);
+        btnInject = BlueBtn("注  入", 358, 270, 108, ThemeAccentDark);
+        btnInject.Font = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
         btnInject.Height = 42;
-        btnInject.Click += delegate { DoInject(); };
+        btnInject.Click += delegate { ManualInject(); };
         Controls.Add(btnInject);
 
         status = new Label();
-        status.Location = new Point(12, 292);
-        status.Size = new Size(446, 84);
-        status.ForeColor = Color.DimGray;
-        status.Text = "正在检测游戏进程...";
+        status.Location = new Point(14, 322);
+        status.Size = new Size(452, 72);
+        status.ForeColor = ThemeText;
+        status.Text = "等待游戏进程启动后将自动注入...";
         Controls.Add(status);
 
         RefreshList();
         StartTimer();
     }
 
-    private Button NewBtn(string text, int x, int y, int w)
+    private Button BlueBtn(string text, int x, int y, int w, Color c)
     {
         Button b = new Button();
         b.Text = text;
         b.Location = new Point(x, y);
         b.Size = new Size(w, 30);
+        b.FlatStyle = FlatStyle.Flat;
+        b.FlatAppearance.BorderSize = 0;
+        b.FlatAppearance.MouseOverBackColor = ThemeHover;
+        b.FlatAppearance.MouseDownBackColor = ThemeAccentDark;
+        b.BackColor = c;
+        b.ForeColor = Color.White;
         return b;
     }
 
@@ -115,49 +138,93 @@ public class MainForm : Form
     private void StartTimer()
     {
         System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
-        t.Interval = 3000;
-        t.Tick += delegate { if (!busy) RefreshList(); };
+        t.Interval = 1500;
+        t.Tick += delegate { AutoTick(); };
         t.Start();
     }
 
-    private void AddProcs(string name)
+    private Process FindNewestGame()
     {
-        Process[] list = Process.GetProcessesByName(name);
-        for (int i = 0; i < list.Length; i++)
+        Process best = null;
+        DateTime bt = DateTime.MinValue;
+        foreach (string name in new string[] { "Subnautica", "Subnautica32" })
         {
-            Process p = list[i];
-            PidEntry e = new PidEntry();
-            e.Pid = p.Id;
-            try { e.Start = p.StartTime; } catch (Exception) { e.Start = DateTime.MinValue; }
-            e.Label = name + ".exe    PID " + p.Id + "    启动于 " + e.Start.ToString("HH:mm:ss");
-            entries.Add(e);
+            Process[] list = Process.GetProcessesByName(name);
+            for (int i = 0; i < list.Length; i++)
+            {
+                DateTime st = DateTime.MinValue;
+                try { st = list[i].StartTime; } catch (Exception) { }
+                if (st >= bt) { bt = st; best = list[i]; }
+            }
         }
+        return best;
     }
 
-    private void RefreshList()
+    private void AutoTick()
+    {
+        if (busy) return;
+        Process p = FindNewestGame();
+        if (p == null)
+        {
+            if (!userPicked && selectedPid > 0)
+            {
+                selectedPid = -1;
+                selectedDesc = "";
+                suppressSel = true;
+                listBox.Items.Clear();
+                suppressSel = false;
+                SetStatus("等待游戏进程启动后将自动注入...", ThemeText);
+            }
+            return;
+        }
+        if (!userPicked)
+        {
+            selectedPid = p.Id;
+            selectedDesc = p.ProcessName + ".exe (自动检测)";
+        }
+        if (p.Id == successPid)
+        {
+            SetStatus("[成功] SNMap 已在游戏内加载 (PID " + p.Id + ")\r\nF9 = 全屏大地图(滚轮缩放/±切换图层)    F7 = 圆形小地图(200/300/500)", Color.Green);
+            return;
+        }
+        if (p.Id == lastAutoPid) return;
+        lastAutoPid = p.Id;
+        DoInject();
+    }
+
+    private void FillList()
     {
         entries.Clear();
-        AddProcs("Subnautica");
-        AddProcs("Subnautica32");
+        foreach (string name in new string[] { "Subnautica", "Subnautica32" })
+        {
+            Process[] list = Process.GetProcessesByName(name);
+            for (int i = 0; i < list.Length; i++)
+            {
+                PidEntry e = new PidEntry();
+                e.Pid = list[i].Id;
+                try { e.Start = list[i].StartTime; } catch (Exception) { e.Start = DateTime.MinValue; }
+                e.Label = name + ".exe    PID " + e.Pid + "    启动于 " + e.Start.ToString("HH:mm:ss");
+                entries.Add(e);
+            }
+        }
         entries.Sort(delegate(PidEntry a, PidEntry b) { return b.Start.CompareTo(a.Start); });
-
         suppressSel = true;
         listBox.BeginUpdate();
         listBox.Items.Clear();
         for (int i = 0; i < entries.Count; i++) listBox.Items.Add(entries[i].Label);
-        listBox.EndUpdate();
         for (int i = 0; i < entries.Count; i++)
         {
             if (entries[i].Pid == selectedPid) { listBox.SelectedIndex = i; break; }
         }
+        listBox.EndUpdate();
         suppressSel = false;
+    }
 
-        if (selectedPid > 0)
-            SetStatus("已选中: " + selectedDesc + "  (PID " + selectedPid + ")  ->  点[注入]", Color.Black);
-        else if (entries.Count > 0)
-            SetStatus("检测到游戏进程, 已自动选中最新启动的。确认后点[注入]。", Color.Black);
-        else
-            SetStatus("未检测到 Subnautica 进程。请先启动游戏(会自动刷新); 若已在运行请点[选择窗口]手动选。", Color.DimGray);
+    private void RefreshList()
+    {
+        FillList();
+        if (entries.Count == 0 && selectedPid <= 0)
+            SetStatus("未检测到游戏进程。启动游戏后会自动注入; 或点[选择窗口]手动选择。", ThemeText);
     }
 
     private void OnListSel(object sender, EventArgs e)
@@ -167,7 +234,9 @@ public class MainForm : Form
         if (idx < 0 || idx >= entries.Count) return;
         selectedPid = entries[idx].Pid;
         selectedDesc = entries[idx].Label;
-        SetStatus("已选中: " + selectedDesc + "  ->  点[注入]", Color.Black);
+        userPicked = true;
+        lastAutoPid = selectedPid; // 手动选择后不再抢注入, 由按钮触发
+        SetStatus("已选中: " + selectedDesc + "  ->  点[注入]", ThemeText);
     }
 
     private void PickWindow()
@@ -189,11 +258,12 @@ public class MainForm : Form
         }, IntPtr.Zero);
 
         Form dlg = new Form();
-        dlg.Text = "选择游戏窗口 (点中游戏画面所在的那个)";
+        dlg.Text = "选择游戏窗口";
         dlg.Size = new Size(560, 440);
         dlg.StartPosition = FormStartPosition.CenterParent;
         dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
         dlg.MaximizeBox = false;
+        dlg.BackColor = ThemeBg;
 
         ListBox lb = new ListBox();
         lb.Dock = DockStyle.Fill;
@@ -201,10 +271,9 @@ public class MainForm : Form
             lb.Items.Add(wins[i].Title + "    [PID " + wins[i].Pid + "]");
         dlg.Controls.Add(lb);
 
-        Button ok = new Button();
-        ok.Text = "确定";
+        Button ok = BlueBtn("确定", 0, 0, 10, ThemeAccent);
         ok.Dock = DockStyle.Bottom;
-        ok.Height = 36;
+        ok.Height = 38;
         ok.Click += delegate
         {
             if (lb.SelectedIndex >= 0) dlg.Tag = wins[lb.SelectedIndex];
@@ -222,7 +291,15 @@ public class MainForm : Form
         suppressSel = false;
         selectedPid = sel.Pid;
         selectedDesc = "窗口[" + sel.Title + "]";
-        SetStatus("已选中: " + selectedDesc + "  (PID " + selectedPid + ")  ->  点[注入]", Color.Black);
+        userPicked = true;
+        lastAutoPid = selectedPid;
+        SetStatus("已选中: " + selectedDesc + "  (PID " + selectedPid + ")  ->  点[注入]", ThemeText);
+    }
+
+    private void ManualInject()
+    {
+        lastAutoPid = -1;   // 允许之后继续自动注入新的 PID
+        DoInject();
     }
 
     private void DoInject()
@@ -230,17 +307,17 @@ public class MainForm : Form
         if (busy) return;
         if (selectedPid <= 0)
         {
-            SetStatus("请先在列表选中游戏进程, 或点[选择窗口]手动选择。", Color.Red);
+            SetStatus("请先等待自动检测, 或点[选择窗口]手动选择。", Color.Red);
             return;
         }
         string here = AppDomain.CurrentDomain.BaseDirectory;
         string boot = Path.Combine(here, "SNMapBoot.dll");
-        string managed = Path.Combine(here, "SNMapManaged.dll");
-        string map = Path.Combine(here, "map.png");
         string log = Path.Combine(here, "SNMap.log");
-        if (!File.Exists(boot) || !File.Exists(managed) || !File.Exists(map))
+        bool hasManaged = false;
+        try { hasManaged = Directory.GetFiles(here, "SNMapManaged*.dll").Length > 0; } catch (Exception) { }
+        if (!File.Exists(boot) || !hasManaged)
         {
-            SetStatus("缺少 SNMapBoot.dll / SNMapManaged.dll / map.png, 请保持它们与本程序同目录。", Color.Red);
+            SetStatus("缺少 SNMapBoot.dll / SNMapManaged*.dll, 请保持它们与本程序同目录。", Color.Red);
             return;
         }
 
@@ -257,18 +334,21 @@ public class MainForm : Form
         }
         catch (Exception ex)
         {
-            SetStatus("无法访问该进程: " + ex.Message + " (游戏可能已退出, 请刷新)", Color.Red);
+            SetStatus("无法访问该进程: " + ex.Message + " (游戏可能已退出, 将自动重试新进程)", Color.Red);
             return;
         }
 
         busy = true;
         btnInject.Enabled = false;
-        SetStatus("正在注入 PID " + selectedPid + " ...", Color.Black);
+        SetStatus("正在注入 PID " + selectedPid + " ...", ThemeText);
         Refresh();
 
         try
         {
-            Injector.Run(selectedPid, boot);
+            string mode = Injector.Run(selectedPid, boot);
+            SetStatus(mode == "triggered"
+                ? "检测到已注入, 触发热重载 (加载最新 SNMapManaged*)..."
+                : "注入完成, 等待游戏内初始化 (约 4 秒)...", ThemeText);
         }
         catch (Exception ex)
         {
@@ -277,8 +357,6 @@ public class MainForm : Form
             btnInject.Enabled = true;
             return;
         }
-
-        SetStatus("注入完成, 等待游戏内初始化 (约 4 秒)...", Color.Black);
         ThreadPool.QueueUserWorkItem(delegate
         {
             Thread.Sleep(4000);
@@ -289,12 +367,17 @@ public class MainForm : Form
             {
                 BeginInvoke((MethodInvoker)delegate
                 {
-                    if (ok)
-                        SetStatus("[成功] SNMap 已在游戏内加载!\r\n游戏内: F9 = 全屏大地图    F7 = 圆形小地图(200/300/500循环)", Color.Green);
-                    else
-                        SetStatus("已注入, 但未确认初始化。若游戏内无反应: 重开游戏后再试, 并把 SNMapBoot.log / SNMap.log 发给作者。", Color.DarkOrange);
                     busy = false;
                     btnInject.Enabled = true;
+                    if (ok)
+                    {
+                        successPid = selectedPid;
+                        SetStatus("[成功] SNMap 已在游戏内加载!\r\nF9 = 全屏大地图(滚轮缩放, －/＋切换图层)    F7 = 圆形小地图(200/300/500)", Color.Green);
+                    }
+                    else
+                    {
+                        SetStatus("已注入, 但未确认初始化。若游戏内无反应: 重开游戏再试, 并把 SNMapBoot.log / SNMap.log 发给作者。", Color.DarkOrange);
+                    }
                 });
             }
             catch (Exception) { }
@@ -334,12 +417,41 @@ internal static class Injector
     static extern IntPtr GetProcAddress(IntPtr h, string name);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern IntPtr GetModuleHandleW(string name);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr LoadLibraryW(string path);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool FreeLibrary(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool Module32FirstW(IntPtr snap, ref MODULEENTRY32W me);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool Module32NextW(IntPtr snap, ref MODULEENTRY32W me);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct MODULEENTRY32W
+    {
+        public uint dwSize;
+        public uint th32ModuleID;
+        public uint th32ProcessID;
+        public uint GlblcntUsage;
+        public uint ProccntUsage;
+        public IntPtr modBaseAddr;
+        public uint modBaseSize;
+        public IntPtr hModule;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string szModule;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExePath;
+    }
 
     const uint PROCESS_CREATE_THREAD = 0x0002, PROCESS_QUERY_INFORMATION = 0x0400,
                PROCESS_VM_OPERATION = 0x0008, PROCESS_VM_WRITE = 0x0020, PROCESS_VM_READ = 0x0010;
     const uint MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000, PAGE_READWRITE = 0x04;
+    const uint TH32CS_SNAPMODULE = 0x00000008;
 
-    public static void Run(int pid, string dllPath)
+    // 返回 "loaded"(首次注入) 或 "triggered"(已注入过, 触发热重载)
+    public static string Run(int pid, string dllPath)
     {
         IntPtr h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
                                PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, false, pid);
@@ -347,6 +459,10 @@ internal static class Injector
             throw new Exception("OpenProcess 失败 (GetLastError=" + Marshal.GetLastWin32Error() + ")");
         try
         {
+            IntPtr remoteBase = FindRemoteModule(pid, "snmapboot.dll");
+            if (remoteBase != IntPtr.Zero)
+                return TriggerReload(h, dllPath, remoteBase);
+
             IntPtr kernel32 = GetModuleHandleW("kernel32.dll");
             IntPtr loadLib = GetProcAddress(kernel32, "LoadLibraryW");
             if (loadLib == IntPtr.Zero) throw new Exception("找不到 kernel32!LoadLibraryW");
@@ -366,7 +482,50 @@ internal static class Injector
             GetExitCodeThread(th, out exitCode);
             CloseHandle(th);
             if (exitCode == 0) throw new Exception("远程 LoadLibrary 返回 0 (DLL 加载失败)");
+            return "loaded";
         }
         finally { CloseHandle(h); }
+    }
+
+    private static IntPtr FindRemoteModule(int pid, string lowerName)
+    {
+        IntPtr snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, (uint)pid);
+        if (snap == IntPtr.Zero || snap == (IntPtr)(-1)) return IntPtr.Zero;
+        try
+        {
+            MODULEENTRY32W me = new MODULEENTRY32W();
+            me.dwSize = (uint)Marshal.SizeOf(typeof(MODULEENTRY32W));
+            if (Module32FirstW(snap, ref me))
+            {
+                do
+                {
+                    if (me.szModule != null && me.szModule.ToLowerInvariant() == lowerName)
+                        return me.modBaseAddr;
+                } while (Module32NextW(snap, ref me));
+            }
+        }
+        finally { CloseHandle(snap); }
+        return IntPtr.Zero;
+    }
+
+    private static string TriggerReload(IntPtr h, string dllPath, IntPtr remoteBase)
+    {
+        IntPtr local = LoadLibraryW(dllPath);
+        if (local == IntPtr.Zero) throw new Exception("本地加载 SNMapBoot.dll 失败");
+        try
+        {
+            IntPtr proc = GetProcAddress(local, "SNMapTrigger");
+            if (proc == IntPtr.Zero) throw new Exception("SNMapBoot.dll 缺少 SNMapTrigger 导出");
+            long rva = proc.ToInt64() - local.ToInt64();
+            IntPtr target = (IntPtr)(remoteBase.ToInt64() + rva);
+            IntPtr tid;
+            IntPtr th = CreateRemoteThread(h, IntPtr.Zero, IntPtr.Zero, target, IntPtr.Zero, 0, out tid);
+            if (th == IntPtr.Zero)
+                throw new Exception("CreateRemoteThread(trigger) 失败 (GetLastError=" + Marshal.GetLastWin32Error() + ")");
+            WaitForSingleObject(th, 10000);
+            CloseHandle(th);
+            return "triggered";
+        }
+        finally { FreeLibrary(local); }
     }
 }

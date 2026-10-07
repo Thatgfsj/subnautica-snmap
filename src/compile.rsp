@@ -1,5 +1,5 @@
 -nostdlib+ -target:library -optimize+ -codepage:65001 -nowarn:1701,1702,0618,0414,0649
--out:..\SNMapManaged.dll
+-out:..\SNMapManaged.v120.dll
 -r:O:\SteamLibrary\steamapps\common\Subnautica\Subnautica_Data\Managed\mscorlib.dll
 -r:O:\SteamLibrary\steamapps\common\Subnautica\Subnautica_Data\Managed\UnityEngine.dll
 -r:O:\SteamLibrary\steamapps\common\Subnautica\Subnautica_Data\Managed\UnityEngine.CoreModule.dll
