@@ -181,6 +181,7 @@ namespace SNMap
         private GUIStyle hudStyle;
         private GUIStyle smallStyle;
         private GUIStyle miniSignalStyle;
+        private GUIStyle alertBlack, alertRed;   // 没头像的生物: 黑描边红感叹号
         private int minimapIdx = 1;   // 0=关闭档, 1..N 对应 MinimapSpans; F7: 200->300->500->1000->关->200
         private List<MapLayer> layers = new List<MapLayer>();
         private FieldInfo pingsDictField;
@@ -1276,9 +1277,7 @@ namespace SNMap
                 }
                 else
                 {
-                    GUI.color = new Color(1f, 0.25f, 0.25f);
-                    GUI.DrawTexture(new Rect(mx - 4f, my - 4f, 8f, 8f), dotTex);
-                    GUI.color = Color.white;
+                    DrawAlertMark(mx, my);      // 没头像的生物: 黑描边红感叹号(原来是红点)
                 }
             }
 
@@ -1528,6 +1527,27 @@ namespace SNMap
 
             miniSignalStyle = new GUIStyle(smallStyle);
             miniSignalStyle.fontSize = Mathf.Max(11, Cfg.FontSize - 8);
+
+            alertBlack = new GUIStyle(hudStyle);
+            alertBlack.fontSize = Mathf.Max(16, Cfg.FontSize + 8);
+            alertBlack.fontStyle = FontStyle.Bold;
+            alertBlack.alignment = TextAnchor.MiddleCenter;
+            alertBlack.normal.textColor = Color.black;
+            alertRed = new GUIStyle(alertBlack);
+            alertRed.normal.textColor = new Color(1f, 0.13f, 0.13f, 1f);
+        }
+
+        // 黑色描边的红色感叹号(给游戏里没有头像的生物当标记)
+        private void DrawAlertMark(float x, float y)
+        {
+            if (alertBlack == null || alertRed == null) return;
+            float w = 22f, h = 26f;
+            Rect r = new Rect(x - w * 0.5f, y - h * 0.5f, w, h);
+            for (int dx = -2; dx <= 2; dx += 2)
+                for (int dy = -2; dy <= 2; dy += 2)
+                    if (dx != 0 || dy != 0)
+                        GUI.Label(new Rect(r.x + dx, r.y + dy, r.width, r.height), "!", alertBlack);
+            GUI.Label(r, "!", alertRed);
         }
     }
 }

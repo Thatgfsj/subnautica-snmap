@@ -130,6 +130,8 @@ public class MapForm : Form
     private readonly SolidBrush shadowBrush = new SolidBrush(Color.FromArgb(200, 0, 0, 0));
     private readonly SolidBrush mapBgBrush = new SolidBrush(MapBg);
     private readonly SolidBrush creatureBrush = new SolidBrush(Color.FromArgb(225, 255, 40, 40));
+    private readonly SolidBrush alertBrush = new SolidBrush(Color.FromArgb(240, 235, 30, 30));
+    private Font alertFont;                       // 没头像的生物用它画"!"
     private SolidBrush[] pingBrushes;
 
     private static readonly Color[] PingColors = new Color[]
@@ -1054,11 +1056,8 @@ public class MapForm : Form
                     }
                     else
                     {
-                        PointF[] tri = new PointF[]
-                        {
-                            new PointF(cp.X, cp.Y - 9f), new PointF(cp.X + 8f, cp.Y + 7f), new PointF(cp.X - 8f, cp.Y + 7f)
-                        };
-                        g.FillPolygon(creatureBrush, tri);
+                        // 没有头像的生物(例如幽灵利维坦, 游戏里就没这张 UI 图): 画黑色描边的红色感叹号
+                        DrawAlertMark(g, cp.X, cp.Y);
                     }
                     if (!string.IsNullOrEmpty(c.Label))
                         DrawShadowText(g, c.Label, smallFont, cp.X + 13f, cp.Y - 8f);
@@ -1129,6 +1128,18 @@ public class MapForm : Form
         catch (Exception) { img = null; }
         iconCache[key] = img;
         return img;
+    }
+
+    // 黑色描边的红色感叹号: 给"游戏里没有头像"的生物当标记(幽灵利维坦等)
+    private void DrawAlertMark(Graphics g, float cx, float cy)
+    {
+        if (alertFont == null) alertFont = new Font("Arial", 24f, FontStyle.Bold, GraphicsUnit.Pixel);
+        SizeF m = g.MeasureString("!", alertFont);
+        float x = cx - m.Width / 2f, y = cy - m.Height / 2f;
+        for (int dx = -2; dx <= 2; dx += 2)
+            for (int dy = -2; dy <= 2; dy += 2)
+                if (dx != 0 || dy != 0) g.DrawString("!", alertFont, Brushes.Black, x + dx, y + dy);
+        g.DrawString("!", alertFont, alertBrush, x, y);
     }
 
     private SolidBrush PingBrush(int idx)
