@@ -653,9 +653,9 @@ namespace SNMap
         private int scanErrLogged;
         private bool scannerApiReady;
         private Type riType;                    // ResourceTrackerDatabase/ResourceInfo
-        private MethodInfo getNodesM;           // static GetNodes(Vector3,float,TechType,ICollection<ResourceInfo>)
-        private Type nodeListType;              // List<ResourceInfo>
+        private MethodInfo getNodesM;           // static ICollection<ResourceInfo> GetNodes(TechType)
         private FieldInfo riTechF, riPosF;
+        private int scanRawTotal;               // 诊断: 数据库返回的原始节点数(过滤前)
 
         private void CollectScannerNodes(Vector3 pp)
         {
@@ -695,35 +695,45 @@ namespace SNMap
                 if (!scannerApiReady)
                 {
                     scannerApiReady = true;
-                    Type dbType = typeof(ResourceTrackerDatabase);
-                    MethodInfo[] ms = dbType.GetMethods(BindingFlags.Public | BindingFlags.Static);
+                    MethodInfo[] ms = typeof(ResourceTrackerDatabase).GetMethods(BindingFlags.Public | BindingFlags.Static);
                     for (int i = 0; i < ms.Length; i++)
                     {
                         if (ms[i].Name != "GetNodes") continue;
-                        ParameterInfo[] ps = ms[i].GetParameters();
-                        if (ps.Length == 4) { getNodesM = ms[i]; break; }
+                        // 只认"单参数 GetNodes(TechType)"这一版: 它直接返回该类型的全部节点(带返回值),
+                        // 而 4 参数那版实测在 (房间位置, 300m) 下返回空集合, 语义靠不住。
+                        if (ms[i].GetParameters().Length == 1 && ms[i].ReturnType != typeof(void)) { getNodesM = ms[i]; break; }
                     }
                     if (getNodesM != null)
                     {
-                        riType = getNodesM.GetParameters()[3].ParameterType.GetGenericArguments()[0];
-                        nodeListType = typeof(List<>).MakeGenericType(riType);
-                        riTechF = riType.GetField("techType");
-                        riPosF = riType.GetField("position");
+                        Type ret = getNodesM.ReturnType;
+                        Type[] ga = ret.IsGenericType ? ret.GetGenericArguments() : null;
+                        if (ga != null && ga.Length == 1)
+                        {
+                            riType = ga[0];
+                            riTechF = riType.GetField("techType");
+                            riPosF = riType.GetField("position");
+                        }
                     }
-                    Cfg.Log("scanner api: GetNodes=" + (getNodesM != null) + " resourceInfo=" + (riType != null));
+                    Cfg.Log("scanner api: GetNodes(TechType)=" + (getNodesM != null) + " resourceInfo=" + (riType != null));
                 }
-                if (getNodesM == null || riType == null) return;
+                if (getNodesM == null || riType == null || scanNodePos.Count >= 48) return;
 
+                // 逐类型取"全世界该类型的节点", 距离过滤自己做(房间范围 + 玩家 600m 双重限制)
+                float lim = range + 60f;
                 for (int t = 0; t < types.Count && scanNodePos.Count < 48; t++)
                 {
-                    System.Collections.IList nodes = (System.Collections.IList)Activator.CreateInstance(nodeListType);
-                    getNodesM.Invoke(null, new object[] { rp, range, types[t], nodes });
-                    for (int i = 0; i < nodes.Count && scanNodePos.Count < 48; i++)
+                    System.Collections.IEnumerable all = null;
+                    try { all = getNodesM.Invoke(null, new object[] { types[t] }) as System.Collections.IEnumerable; }
+                    catch (Exception ex) { if (scanErrLogged < 3) { scanErrLogged++; Cfg.Log("GetNodes invoke fail: " + ex.Message); } }
+                    if (all == null) continue;
+                    foreach (object info in all)
                     {
-                        object info = nodes[i];
+                        if (info == null || scanNodePos.Count >= 48) break;
+                        scanRawTotal++;
                         TechType tt = (TechType)riTechF.GetValue(info);
                         Vector3 pos = (Vector3)riPosF.GetValue(info);
-                        if ((pos - pp).sqrMagnitude > 360000f) continue;      // 600m 内才画
+                        if ((pos - rp).sqrMagnitude > lim * lim) continue;         // 离扫描室太远
+                        if ((pos - pp).sqrMagnitude > 640000f) continue;           // 离玩家 >800m 不画
                         scanNodePos.Add(pos);
                         scanNodeKey.Add(tt.ToString());
                         string cn = null;
@@ -731,6 +741,9 @@ namespace SNMap
                         scanNodeName.Add(string.IsNullOrEmpty(cn) ? tt.ToString() : cn);
                     }
                 }
+                if (frame % 300 == 0)
+                    Cfg.Log("scanner: 数据库原始节点=" + scanRawTotal + " 采用=" + scanNodePos.Count +
+                            " 第一个=" + (scanNodeKey.Count > 0 ? scanNodeKey[0] : "-"));
             }
             catch (Exception ex)
             {
