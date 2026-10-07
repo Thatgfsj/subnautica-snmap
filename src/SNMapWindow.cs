@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
@@ -114,6 +115,9 @@ public class MapForm : Form
     private int minimapPixels = 360;
     private readonly List<string> species = new List<string>();   // 模块见过的敌对物种(TechType 名)
     private SNMapSettingsForm settingsDlg;
+    private byte[] stateReadBuf;                                  // 复用: 不再每 tick new 8KB
+    private readonly List<Beacon> beaconFree = new List<Beacon>();       // 复用池(不参与绘制)
+    private readonly List<CreaturePt> creatureFree = new List<CreaturePt>();
 
     private readonly Pen beaconPen = new Pen(Color.FromArgb(200, 10, 10, 10), 2f);
     private readonly Pen scalePen = new Pen(Color.White, 3f);
@@ -343,9 +347,16 @@ public class MapForm : Form
             }
         }
         viewCX = 0; viewCZ = 0;
+        // 启动就把当前图层写回设置文件: 模块的小地图跟随这个索引(也决定它去加载哪个 SNMapMini_*.jpg 预览)
+        WriteSettingsKey(Proto.KeyWindowLayer, layerIdx.ToString());
     }
 
-    // mip 金字塔: 4096 -> 2048 -> ... -> 256, 一次性预缩放, 之后每帧只做块拷贝
+    // mip 金字塔: 原图 -> 2048 -> 1024 -> ... 一次性预缩放, 之后每帧只做块拷贝
+    // 2048 起点: 整图视野只要 ~4.7m/px, 4096 起点白占 60MB 内存(这台机器内存不稳, 宁可省)
+    private const int MipStartCap = 2048;
+    // 给游戏内模块导出的小预览边长(模块拿它当小地图纹理, 免得在游戏进程里解码 40~256MB 的原图)
+    private const int MiniPreviewSide = 3072;
+
     private void EnsureMips(MapLayer L)
     {
         if (L.Mips != null || !File.Exists(L.Path)) return;
@@ -353,9 +364,10 @@ public class MapForm : Form
         {
             using (Image orig = Image.FromFile(L.Path))
             {
+                ExportMiniPreview(L, orig);
                 int maxDim = Math.Max(orig.Width, orig.Height);
-                int startW = Math.Max(16, orig.Width * Math.Min(maxDim, 4096) / maxDim);
-                int startH = Math.Max(16, orig.Height * Math.Min(maxDim, 4096) / maxDim);
+                int startW = Math.Max(16, orig.Width * Math.Min(maxDim, MipStartCap) / maxDim);
+                int startH = Math.Max(16, orig.Height * Math.Min(maxDim, MipStartCap) / maxDim);
                 List<Image> mips = new List<Image>();
                 List<float> scales = new List<float>();
                 Image prev = new Bitmap(orig, startW, startH);
@@ -382,6 +394,45 @@ public class MapForm : Form
         {
             L.Mips = null;
         }
+    }
+
+    // 给游戏内模块导出小预览(同一张图的缩小版): 模块的小地图只要一个圆,
+    // 没必要让它在游戏进程里解码 3240²/8192² 的原图(40~256MB, 切图层还要重来)
+    private void ExportMiniPreview(MapLayer L, Image orig)
+    {
+        try
+        {
+            string outp = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SNMapMini_" + layerIdx + ".jpg");
+            if (File.Exists(outp) && File.GetLastWriteTimeUtc(outp) >= File.GetLastWriteTimeUtc(L.Path)) return;
+            int md = Math.Max(orig.Width, orig.Height);
+            int side = Math.Min(MiniPreviewSide, md);
+            int w = Math.Max(1, orig.Width * side / md);
+            int h = Math.Max(1, orig.Height * side / md);
+            using (Bitmap bmp = new Bitmap(w, h))
+            {
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.Half;
+                    g.DrawImage(orig, new Rectangle(0, 0, w, h));
+                }
+                ImageCodecInfo jpg = null;
+                foreach (ImageCodecInfo c in ImageCodecInfo.GetImageEncoders())
+                {
+                    if (c.FormatID == ImageFormat.Jpeg.Guid) { jpg = c; break; }
+                }
+                if (jpg != null)
+                {
+                    using (EncoderParameters ep = new EncoderParameters(1))
+                    {
+                        ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 92L);
+                        bmp.Save(outp, jpg, ep);
+                    }
+                }
+                else bmp.Save(outp, ImageFormat.Jpeg);
+            }
+        }
+        catch (Exception) { }
     }
 
     private void SwitchLayer(int delta)
@@ -630,22 +681,23 @@ public class MapForm : Form
         {
             string sp = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, Proto.StateFileName);
             if (!File.Exists(sp)) throw new Exception();
-            byte[] buf;
+            if (stateReadBuf == null) stateReadBuf = new byte[Proto.StateSize];
+            byte[] buf = stateReadBuf;
             // 显式 FileShare.ReadWrite: File.ReadAllBytes 用的是 FileShare.Read, 会把模块那头的
             // 20Hz 写入挡掉(写失败就丢帧, 表现还是"不刷新")
             using (FileStream fs = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             {
-                buf = new byte[fs.Length];
+                int total = (int)Math.Min(fs.Length, buf.Length);
                 int got = 0;
-                while (got < buf.Length)
+                while (got < total)
                 {
-                    int r = fs.Read(buf, got, buf.Length - got);
+                    int r = fs.Read(buf, got, total - got);
                     if (r <= 0) break;
                     got += r;
                 }
-                if (got != buf.Length) throw new Exception();
+                if (got < 128) throw new Exception();
             }
-            if (buf.Length < 128 || GetInt(buf, OffMagic) != Magic) throw new Exception();
+            if (GetInt(buf, OffMagic) != Magic) throw new Exception();
             int ver = GetInt(buf, OffVersion);
             if (ver != ProtoVersion)
             {
@@ -661,11 +713,13 @@ public class MapForm : Form
             heading = GetFloat(buf, OffHeading);
             biome = GetString(buf, OffBiomeLen, OffBiome, 64);
 
-            int n = ClampI(GetInt(buf, OffBeaconCount), 0, 32);
+            int n = ClampI(GetInt(buf, OffBeaconCount), 0, Proto.MaxBeacons);
             for (int i = 0; i < n; i++)
             {
                 int off = OffBeacons + i * 128;
-                Beacon bk = new Beacon();
+                Beacon bk;
+                if (i < beaconFree.Count) bk = beaconFree[i];
+                else { bk = new Beacon(); beaconFree.Add(bk); }
                 bk.X = GetFloat(buf, off);
                 bk.Z = GetFloat(buf, off + 4);
                 bk.Color = GetInt(buf, off + 8);
@@ -676,7 +730,9 @@ public class MapForm : Form
             for (int i = 0; i < cn; i++)
             {
                 int off = OffCreatures + i * 80;
-                CreaturePt c = new CreaturePt();
+                CreaturePt c;
+                if (i < creatureFree.Count) c = creatureFree[i];
+                else { c = new CreaturePt(); creatureFree.Add(c); }
                 c.X = GetFloat(buf, off);
                 c.Z = GetFloat(buf, off + 4);
                 c.Label = GetString(buf, off + 8, off + 12, 66);

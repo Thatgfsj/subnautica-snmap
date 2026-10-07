@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.5";   // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X")
+        public const string Version = "2.6";   // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X")
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -188,6 +188,11 @@ namespace SNMap
         private List<string> creatureShow;                   // 设置窗口勾选"要显示"的物种(TechType 名); null 且 !showAll 时回落到 config.ini 白名单
         private bool creatureShowAll;                        // CreatureShow="*"
         private readonly List<string> seenSpecies = new List<string>();   // 见过的敌对物种, 供设置窗口列出"全部敌对生物"
+        private KeyCode keyMap, keyHud;                      // 解析一次的热键
+        private bool keyMapOk, keyHudOk;
+        private byte[] modVerBytes;                          // 版本串字节(避免每次写状态都分配)
+        private string biomeCnCache;                         // HUD 中文群系(节流, 不必每帧问游戏)
+        private int biomeFrame = -1000;
 
         private static readonly string[] Headings = new string[]
         {
@@ -215,6 +220,15 @@ namespace SNMap
             LoadLayers();
             LoadPingsApi();
             stateBuf = new byte[8192];
+            modVerBytes = Encoding.UTF8.GetBytes(Cfg.Version);
+            if (modVerBytes.Length > 32) Array.Resize(ref modVerBytes, 32);
+
+            // 热键只在这里解析一次: 原来每帧两次 Enum.TryParse(反射+字符串比较)
+            keyMapOk = Enum.TryParse(Cfg.ToggleMapKey, true, out keyMap);
+            keyHudOk = Enum.TryParse(Cfg.ToggleHudKey, true, out keyHud);
+            if (!keyMapOk) Cfg.Log("bad ToggleMapKey: " + Cfg.ToggleMapKey);
+            if (!keyHudOk) Cfg.Log("bad ToggleHudKey: " + Cfg.ToggleHudKey);
+
             if (layers.Count > 0) GetTex(layers[0]);
 
             Cfg.Log("SNMap " + Cfg.Version + " awake | layers=" + layers.Count +
@@ -224,8 +238,7 @@ namespace SNMap
 
         private void Update()
         {
-            KeyCode kc;
-            if (Enum.TryParse(Cfg.ToggleMapKey, true, out kc) && Input.GetKeyDown(kc))
+            if (keyMapOk && Input.GetKeyDown(keyMap))
             {
                 // 读-翻转-写 设置文件里的 ShowWindow(与地图窗口共用)
                 byte cur = ReadSettingsByte(Proto.KeyShowWindow, 0);
@@ -233,7 +246,7 @@ namespace SNMap
                 WriteSettingsKey(Proto.KeyShowWindow, showWindow ? "1" : "0");
                 settingsShowWindow = showWindow ? (byte)1 : (byte)0;
             }
-            if (Enum.TryParse(Cfg.ToggleHudKey, true, out kc) && Input.GetKeyDown(kc))
+            if (keyHudOk && Input.GetKeyDown(keyHud))
             {
                 minimapIdx = (minimapIdx + 1) % (Cfg.MinimapSpans.Length + 1);   // +1 = 末尾关闭档
             }
@@ -371,11 +384,9 @@ namespace SNMap
                 PutLong(buf, Proto.OffTick, Environment.TickCount);
                 buf[Proto.OffShowWindow] = settingsShowWindow;
 
-                // 模块版本串写进状态文件(窗口显示"模块vX.X"), 上限 32 字节
-                byte[] mv = Encoding.UTF8.GetBytes(Cfg.Version);
-                if (mv.Length > 32) Array.Resize(ref mv, 32);
-                PutInt(buf, Proto.OffModVerLen, mv.Length);
-                PutBytes(buf, Proto.OffModVer, mv);
+                // 模块版本串写进状态文件(窗口显示"模块vX.X"), 上限 32 字节(字节数组在 Awake 里备好)
+                PutInt(buf, Proto.OffModVerLen, modVerBytes.Length);
+                PutBytes(buf, Proto.OffModVer, modVerBytes);
 
                 Player pl = Player.main;
                 int valid = 0;
@@ -576,6 +587,10 @@ namespace SNMap
 
         private void OnGUI()
         {
+            // 只在 Repaint 事件里画: Unity 每帧至少还会发一次 Layout 事件, 不守这一下等于所有绘制都做两遍
+            // (小地图是按列切片画的, 300~800 次 DrawTexture 翻倍就是上千次/帧)
+            if (Event.current.type != EventType.Repaint) return;
+
             Player pl = Player.main;
             if (pl == null || pl.transform == null) return;
             EnsureStyles();
@@ -583,8 +598,13 @@ namespace SNMap
             Vector3 pos = pl.transform.position;
             float depth = -pos.y;
             try { depth = pl.GetDepth(); } catch (Exception) { }
-            string biome = null;
-            try { biome = Proto.BiomeCnOrNull(pl.GetBiomeString()); } catch (Exception) { }
+            // 群系字符串每次都从游戏取会分配字符串 + 查字典, 而它变得很慢: 4 Hz 刷新一次够了
+            if (frame - biomeFrame >= 15)
+            {
+                biomeFrame = frame;
+                try { biomeCnCache = Proto.BiomeCnOrNull(pl.GetBiomeString()); } catch (Exception) { biomeCnCache = null; }
+            }
+            string biome = biomeCnCache;
 
             string dir8 = Heading8();
             string line;
@@ -694,21 +714,45 @@ namespace SNMap
             return layers.Count > 0 ? layers[0] : null;
         }
 
+        // 窗口导出的小预览文件名(和大地图窗口约定)
+        public static string MiniPreviewName(int layerIdx) { return "SNMapMini_" + layerIdx + ".jpg"; }
+
+        // 小地图只需要一个圆, 但地图原图是 3240²/8192² —— 整张解码进游戏进程就是 40~256MB,
+        // 每次切图层还要销毁重来一次(主线程卡顿 + 内存峰值)。
+        // 所以优先加载【窗口导出的小预览】(窗口本来就要加载整张地图, 顺手导出 ≤3072 的 JPEG);
+        // 没有预览(比如窗口没开过)才退回加载原图。
         private Texture2D GetTex(MapLayer L)
         {
             if (L == null) return null;
             if (L.Tex != null) return L.Tex;
             try
             {
-                if (!File.Exists(L.Path)) return null;
-                byte[] raw = File.ReadAllBytes(L.Path);
-                Texture2D tex = new Texture2D(4, 4, TextureFormat.RGBA32, false);
-                tex.wrapMode = TextureWrapMode.Clamp;
-                if (!tex.LoadImage(raw))
+                if (windowLayer >= 0 && windowLayer < layers.Count && layers[windowLayer] == L)
                 {
-                    UnityEngine.Object.Destroy(tex);
-                    return null;
+                    string mini = Path.Combine(Cfg.BaseDir, MiniPreviewName(windowLayer));
+                    // 预览比原图旧说明地图被换过 -> 老老实实读原图, 别显示过期的图
+                    if (File.Exists(mini) && File.GetLastWriteTimeUtc(mini) >= File.GetLastWriteTimeUtc(L.Path))
+                    {
+                        Texture2D mt = LoadTexture(mini);
+                        if (mt != null)
+                        {
+                            L.Tex = mt;
+                            L.Width = mt.width;
+                            L.Height = mt.height;
+                            if (!L.HasIniBounds)
+                            {
+                                float ar = L.Height > 0 ? (float)L.Width / L.Height : 1f;
+                                L.Calibrated = ar > 0.9f && ar < 1.1f;
+                            }
+                            ReleaseOtherTextures(L);
+                            return mt;
+                        }
+                    }
                 }
+
+                if (!File.Exists(L.Path)) return null;
+                Texture2D tex = LoadTexture(L.Path);
+                if (tex == null) return null;
                 L.Tex = tex;
                 L.Width = tex.width;
                 L.Height = tex.height;
@@ -717,20 +761,38 @@ namespace SNMap
                     float ar = L.Height > 0 ? (float)L.Width / L.Height : 1f;
                     L.Calibrated = ar > 0.9f && ar < 1.1f;
                 }
-                for (int i = 0; i < layers.Count; i++)
-                {
-                    if (layers[i] != L && layers[i].Tex != null)
-                    {
-                        UnityEngine.Object.Destroy(layers[i].Tex);
-                        layers[i].Tex = null;
-                    }
-                }
+                ReleaseOtherTextures(L);
                 return tex;
             }
             catch (Exception ex)
             {
                 Cfg.Log("load layer failed: " + L.Name + " (" + ex.Message + ")");
                 return null;
+            }
+        }
+
+        private static Texture2D LoadTexture(string path)
+        {
+            byte[] raw = File.ReadAllBytes(path);
+            Texture2D tex = new Texture2D(4, 4, TextureFormat.RGBA32, false);
+            tex.wrapMode = TextureWrapMode.Clamp;
+            if (!tex.LoadImage(raw))
+            {
+                UnityEngine.Object.Destroy(tex);
+                return null;
+            }
+            return tex;
+        }
+
+        private void ReleaseOtherTextures(MapLayer keep)
+        {
+            for (int i = 0; i < layers.Count; i++)
+            {
+                if (layers[i] != keep && layers[i].Tex != null)
+                {
+                    UnityEngine.Object.Destroy(layers[i].Tex);
+                    layers[i].Tex = null;
+                }
             }
         }
 

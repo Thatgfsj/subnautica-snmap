@@ -22,6 +22,7 @@ namespace SNMap
 
         public const int Version = 3;           // v3: 增加物种清单(OffSpecies*)与两个新设置键
         public const int Magic = 0x534E4D50;
+        public const int StateSize = 8192;      // 状态文件固定长度(窗口复用读缓冲要用)
 
         public const int OffMagic = 0;          // int
         public const int OffVersion = 4;        // int

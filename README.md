@@ -5,7 +5,7 @@ A trainer-style minimap & standalone map window for **Subnautica (Steam, x64)**.
 
 > 仅用于单人游戏与学习交流。请勿用于任何联机对抗场景。
 
-当前版本：**v2.5**
+当前版本：**v2.6**
 
 ## 坐标系约定（改代码必读）
 
