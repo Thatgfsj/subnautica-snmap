@@ -161,6 +161,9 @@ namespace SNMap
         private float zoom = 1f;
         private float centerU = 0.5f;
         private float centerV = 0.5f;
+        private Rect bigMapRect;
+        private bool bigMapRectValid;
+        private Vector2 lastMouseGui = new Vector2(-9999f, -9999f);
         private CursorLockMode prevLock = CursorLockMode.None;
         private bool prevVisible = true;
         private FieldInfo pingsDictField;
@@ -241,6 +244,8 @@ namespace SNMap
             {
                 mapOpen = !mapOpen;
                 if (mapOpen) FreeCursor(); else RestoreCursor();
+                bigMapRectValid = false;
+                lastMouseGui = new Vector2(-9999f, -9999f);
             }
             if (Enum.TryParse(Cfg.ToggleHudKey, true, out kc) && Input.GetKeyDown(kc))
             {
@@ -251,7 +256,46 @@ namespace SNMap
                 try { GameInput.ClearInput(2); } catch (Exception) { }
                 // 游戏每帧都会重新锁鼠标, 必须每帧抢回来
                 try { Cursor.lockState = CursorLockMode.None; Cursor.visible = true; } catch (Exception) { }
+                // 滚轮/拖拽走游戏自己的 Input 通道, 不依赖 IMGUI 事件
+                HandleMapInputRaw();
             }
+        }
+
+        // 大地图输入: Input 通道版(Update 内), 不用 IMGUI 事件
+        private void HandleMapInputRaw()
+        {
+            if (!bigMapRectValid) return;
+            Vector3 mp = Input.mousePosition;
+            Vector2 gui = new Vector2(mp.x, Screen.height - mp.y);
+            if (lastMouseGui.x < -1000f) { lastMouseGui = gui; return; }
+            Vector2 delta = gui - lastMouseGui;
+
+            float wheel = 0f;
+            try { wheel = Input.GetAxis("Mouse ScrollWheel"); } catch (Exception) { }
+            if (Mathf.Abs(wheel) > 0.0001f && bigMapRect.Contains(gui))
+            {
+                float spanU = 1f / zoom, spanV = 1f / zoom;
+                float mu = centerU - spanU * 0.5f + (gui.x - bigMapRect.x) / bigMapRect.width * spanU;
+                float mv = centerV - spanV * 0.5f + (gui.y - bigMapRect.y) / bigMapRect.height * spanV;
+                float oldZoom = zoom;
+                zoom = Mathf.Clamp(zoom * (wheel > 0f ? 1.25f : 0.8f), 1f, 16f);
+                if (zoom != oldZoom)
+                {
+                    float nu = 1f / zoom, nv = 1f / zoom;
+                    centerU = mu + (centerU - mu) * (nu / spanU);
+                    centerV = mv + (centerV - mv) * (nv / spanV);
+                }
+            }
+
+            if (Input.GetMouseButton(0) && zoom > 1f && bigMapRect.Contains(gui))
+            {
+                float su = 1f / zoom, sv = 1f / zoom;
+                centerU -= delta.x / bigMapRect.width * su;
+                centerV -= delta.y / bigMapRect.height * sv;
+                centerU = Mathf.Clamp(centerU, su * 0.5f, 1f - su * 0.5f);
+                centerV = Mathf.Clamp(centerV, sv * 0.5f, 1f - sv * 0.5f);
+            }
+            lastMouseGui = gui;
         }
 
         private void FreeCursor()
@@ -532,7 +576,7 @@ namespace SNMap
             float ang = HeadingAngle();
             Matrix4x4 old = GUI.matrix;
             GUIUtility.RotateAroundPivot(ang, sq.center);
-            GUI.DrawTexture(new Rect(sq.center.x - 13f, sq.center.y - 13f, 26f, 26f), arrowTex);
+            GUI.DrawTexture(new Rect(sq.center.x - 9f, sq.center.y - 9f, 18f, 18f), arrowTex);
             GUI.matrix = old;
 
             LabelShadowed(new Rect(sq.center.x - 20f, sq.y + 4f, 40f, 20f), "N", smallStyle);
@@ -585,8 +629,9 @@ namespace SNMap
             float drawW = side, drawH = side;
             if (ar >= 1f) drawH = side / ar; else drawW = side * ar;
             Rect sq = new Rect((Screen.width - drawW) * 0.5f, 48f + (availH - drawH) * 0.5f, drawW, drawH);
+            bigMapRect = sq;
+            bigMapRectValid = true;
 
-            HandleBigMapInput(sq);
             float spanU = 1f / zoom, spanV = 1f / zoom;
             centerU = Mathf.Clamp(centerU, spanU * 0.5f, 1f - spanU * 0.5f);
             centerV = Mathf.Clamp(centerV, spanV * 0.5f, 1f - spanV * 0.5f);
@@ -639,36 +684,6 @@ namespace SNMap
             }
         }
 
-        private void HandleBigMapInput(Rect sq)
-        {
-            Event e = Event.current;
-            if (e == null) return;
-            float spanU = 1f / zoom, spanV = 1f / zoom;
-            float u0 = centerU - spanU * 0.5f, v0 = centerV - spanV * 0.5f;
-
-            if (e.type == EventType.ScrollWheel && sq.Contains(e.mousePosition))
-            {
-                float mu = u0 + (e.mousePosition.x - sq.x) / sq.width * spanU;
-                float mv = v0 + (e.mousePosition.y - sq.y) / sq.height * spanV;
-                float oldZoom = zoom;
-                zoom = Mathf.Clamp(zoom * (e.delta.y > 0f ? 1.25f : 0.8f), 1f, 16f);
-                if (zoom != oldZoom)
-                {
-                    float nu = 1f / zoom, nv = 1f / zoom;
-                    centerU = mu + (centerU - mu) * (nu / spanU);
-                    centerV = mv + (centerV - mv) * (nv / spanV);
-                }
-                e.Use();
-            }
-            else if (e.type == EventType.MouseDrag && e.button == 0 &&
-                     zoom > 1f && sq.Contains(e.mousePosition))
-            {
-                centerU -= e.delta.x / sq.width * spanU;
-                centerV -= e.delta.y / sq.height * spanV;
-                e.Use();
-            }
-        }
-
         // ------------------------------------------------------------- shared draw
 
         private void DrawPlayer(MapLayer L, Player pl, Rect sq, float u0, float v0, float spanU, float spanV)
@@ -679,7 +694,7 @@ namespace SNMap
             if (!WorldToWindow(L, p.x, p.z, sq, u0, v0, spanU, spanV, out mx, out my)) return;
 
             float ang = HeadingAngle();
-            float a = 34f;
+            float a = 24f;
             Matrix4x4 old = GUI.matrix;
             GUIUtility.RotateAroundPivot(ang, new Vector2(mx, my));
             GUI.DrawTexture(new Rect(mx - a * 0.5f, my - a * 0.5f, a, a), arrowTex);
@@ -785,6 +800,7 @@ namespace SNMap
         }
 
         // 朝向: 用渲染相机 (Player.main.transform 不随视角旋转!)
+        // 实测 MainCamera.camera 的 forward 与实际视线方向相反(经验修正 +180)
         private static float HeadingAngle()
         {
             Vector3 f = Vector3.zero;
@@ -795,7 +811,7 @@ namespace SNMap
             }
             catch (Exception) { }
             if (f.sqrMagnitude < 0.000001f) return 0f;
-            float a = Mathf.Atan2(f.x, -f.z) * Mathf.Rad2Deg;
+            float a = Mathf.Atan2(f.x, -f.z) * Mathf.Rad2Deg + 180f;
             if (a < 0f) a += 360f;
             if (a >= 360f) a -= 360f;
             return a;
