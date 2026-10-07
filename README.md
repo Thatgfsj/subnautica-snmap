@@ -5,7 +5,7 @@ A trainer-style minimap & standalone map window for **Subnautica (Steam, x64)**.
 
 > 仅用于单人游戏与学习交流。请勿用于任何联机对抗场景。
 
-当前版本：**v2.6**
+当前版本：**v2.7**
 
 ## 坐标系约定（改代码必读）
 
@@ -26,7 +26,7 @@ A trainer-style minimap & standalone map window for **Subnautica (Steam, x64)**.
 ## 下载 / Download
 
 **[⬇ 最新发布包 SNMap-v2.6-win64.zip](https://github.com/Thatgfsj/subnautica-snmap/releases/latest)** —— 解压到任意目录（放桌面就行），启动游戏后双击 `SNInjector.exe` 即可。
-发布包内已含全部地图图层与说明；**仓库本身不含二进制与地图图片**。
+发布包内已含全部地图图层、图标包与说明；**仓库内也已包含地图图层（`maps/`）与图标包（`icons/`）**，直接下载本仓库的 zip 同样可用（但仓库不含编译好的 exe/dll，那部分请用 Release 包）。
 
 ## 使用
 
@@ -70,7 +70,7 @@ src/SnMapStandalone.cs  游戏内模块 (C#5, 无 BepInEx)              -> csc @
 src/SNMapShared.cs      模块与窗口共享协议/生物群系中文表（编进上面两个目标）
 ```
 
-Release 压缩包解压即用（含全部图层）；仓库不含二进制与地图图片。
+Release 压缩包解压即用（含全部图层与图标包）；仓库内也含 `maps/` 与 `icons/`，只是不含编译好的 exe/dll。
 
 ## 实现原理
 
@@ -81,8 +81,8 @@ Release 压缩包解压即用（含全部图层）；仓库不含二进制与地
 
 ## 致谢 Credits
 
-- 主地图：KT411 2024 中文全标注图；图层来源：[subnauticawiki.com](https://www.subnauticawiki.com/zh/map)（碧蓝之星汉化组）等社区作品，版权归原作者所有
-- 地图图片不随本仓库分发，随 Release 包附带仅用于便利玩家，侵权请联系删除
+- 主地图：**KT411 2024 中文全标注图**；其余图层来源：[subnauticawiki.com](https://www.subnauticawiki.com/zh/map)（碧蓝之星汉化组）等社区作品，**版权归原作者所有**
+- 地图图片随本仓库与 Release 包一并提供，仅为方便玩家、非商业用途；如作者希望署名调整或撤下，请提 Issue，会立即处理（详见 `maps/来源说明.txt`）
 
 ## License
 
