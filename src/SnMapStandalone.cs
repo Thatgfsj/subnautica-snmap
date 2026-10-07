@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.4";   // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X")
+        public const string Version = "2.5";   // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X")
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -184,6 +184,10 @@ namespace SNMap
         private int frame;
         private bool showWindow = true;   // 窗口进程的期望状态(与设置文件 ShowWindow 同步)
         private bool showCreatures = true;
+        private bool showScanSignals = true;                 // 扫描室扫描目标是否显示(小地图橙点)
+        private List<string> creatureShow;                   // 设置窗口勾选"要显示"的物种(TechType 名); null 且 !showAll 时回落到 config.ini 白名单
+        private bool creatureShowAll;                        // CreatureShow="*"
+        private readonly List<string> seenSpecies = new List<string>();   // 见过的敌对物种, 供设置窗口列出"全部敌对生物"
 
         private static readonly string[] Headings = new string[]
         {
@@ -263,6 +267,25 @@ namespace SNMap
                     }
                 }
                 if (d.TryGetValue(Proto.KeyShowCreatures, out s)) showCreatures = s != "0";
+                if (d.TryGetValue(Proto.KeyShowScanSignals, out s)) showScanSignals = s != "0";
+                if (d.TryGetValue(Proto.KeyCreatureShow, out s))
+                {
+                    // 设置窗口里按物种勾选的结果: 逗号分隔的 TechType 名; "*"=全部显示
+                    string t = s.Trim();
+                    if (t == "*") { creatureShowAll = true; creatureShow = null; }
+                    else
+                    {
+                        creatureShowAll = false;
+                        List<string> names = new List<string>();
+                        string[] parts = t.Split(new char[] { ',', ';' });
+                        for (int k = 0; k < parts.Length; k++)
+                        {
+                            string nm = parts[k].Trim();
+                            if (nm.Length > 0) names.Add(nm);
+                        }
+                        creatureShow = names;   // 空列表 = 一个都不显示
+                    }
+                }
                 if (d.TryGetValue(Proto.KeyWindowLayer, out s))
                 {
                     int wi;
@@ -381,6 +404,19 @@ namespace SNMap
                 }
                 PutInt(buf, Proto.OffCreatureCount, creatureCount);
 
+                // 见过的敌对物种清单(设置窗口右侧"全部敌对生物"用), 每次写状态都带上,
+                // 否则 19/20 次写入会在 Array.Clear 之后变成空清单
+                int sc = Mathf.Min(seenSpecies.Count, Proto.MaxSpecies);
+                PutInt(buf, Proto.OffSpeciesCount, sc);
+                for (int i = 0; i < sc; i++)
+                {
+                    byte[] nb = Encoding.UTF8.GetBytes(seenSpecies[i]);
+                    if (nb.Length > Proto.SpeciesStride - 4) Array.Resize(ref nb, Proto.SpeciesStride - 4);
+                    int so = Proto.OffSpecies + i * Proto.SpeciesStride;
+                    PutInt(buf, so, nb.Length);
+                    PutBytes(buf, so + 4, nb);
+                }
+
                 string sp = Path.Combine(Cfg.BaseDir, Proto.StateFileName);
                 // 就地覆盖, 不截断: 窗口每 33ms 读一次, 用 FileMode.Create 会先把文件截成 0 字节,
                 // 读的那一头就会拿到半截文件 -> 生物"忽有忽无/坐标乱跳"。文件长度保持恒定后,
@@ -471,12 +507,15 @@ namespace SNMap
                 {
                     if (c == null || !c.gameObject.activeInHierarchy) continue;
                     if (c.GetComponent<AggressiveWhenSeeTarget>() == null && c.GetComponent<AttackLastTarget>() == null) continue;
-                    // 白名单过滤(config.ini CreatureWhitelist, 空=全部)
-                    if (Cfg.CreatureWhitelist != null)
+                    TechTag tg = c.GetComponent<TechTag>();
+                    // 物种清单: 不管当前勾没勾显示, 见过就记下来(设置窗口要能列出全部敌对生物)
+                    if (tg != null)
                     {
-                        TechTag tg = c.GetComponent<TechTag>();
-                        if (tg == null || !Cfg.CreatureWhitelist.Contains(tg.type)) continue;
+                        string sp = tg.type.ToString();
+                        if (sp.Length > 0 && seenSpecies.Count < Proto.MaxSpecies && !seenSpecies.Contains(sp))
+                            seenSpecies.Add(sp);
                     }
+                    if (!CreatureVisible(tg)) continue;
                     if ((c.transform.position - pp).sqrMagnitude > 360000f) continue;
                     aggr.Add(c);
                 }
@@ -510,6 +549,17 @@ namespace SNMap
 
         private int creatureCount;
         private int lastCreatureFrame;
+
+        // 按设置窗口的勾选判断某物种是否显示:
+        //   CreatureShow 键存在 -> 只显示列表里的(空 = 一个都不显示); "*" = 全部显示
+        //   没有该键 -> 回落到 config.ini 的 CreatureWhitelist(空=全部)
+        private bool CreatureVisible(TechTag tg)
+        {
+            if (creatureShowAll) return true;
+            if (creatureShow != null) return tg != null && creatureShow.Contains(tg.type.ToString());
+            if (Cfg.CreatureWhitelist == null) return true;
+            return tg != null && Cfg.CreatureWhitelist.Contains(tg.type);
+        }
 
         private static string CreatureName(Creature c)
         {
@@ -742,6 +792,7 @@ namespace SNMap
                     float sy = sq.y + (1f - (q.z - winZ0) / spanWorld) * D;
                     if (Vector2.Distance(new Vector2(sx, sy), sq.center) > D * 0.5f - 13f) continue;
                     bool isScan = pi.pingType == PingType.Signal;   // 扫描室扫描目标
+                    if (isScan && !showScanSignals) continue;       // 设置窗口里可关掉
                     if (isScan) GUI.color = new Color(1f, 0.62f, 0.1f);
                     else
                     {

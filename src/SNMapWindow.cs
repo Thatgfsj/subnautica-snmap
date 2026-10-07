@@ -69,7 +69,7 @@ public class MapForm : Form
     private const int OffBeaconCount = 80, OffBiomeLen = 84, OffBiome = 88;
     private const int OffBeacons = 128;
     private const int OffCreatureCount = 4268, OffCreatures = 4272;
-    private const int Magic = 0x534E4D50, ProtoVersion = 2;
+    private const int Magic = Proto.Magic, ProtoVersion = Proto.Version;
 
     private static readonly Color ThemeBg = Color.FromArgb(232, 241, 252);
     private static readonly Color ThemeAccent = Color.FromArgb(25, 118, 210);
@@ -102,12 +102,18 @@ public class MapForm : Form
     private bool lastHasGame;
     private string lastBiome = "";
 
-    private Button btnPrev, btnNext, btnExit, btnApply;
-    private CheckBox chkFollow, chkTop, chkCreatures;
-    private TextBox txtMini;
+    private Button btnPrev, btnNext, btnExit, btnSettings;
+    private CheckBox chkFollow, chkTop;
     private Label lblLayer, lblInfo;
     private Font mapFont, smallFont;
     private Keys toggleKey = Keys.F9;   // 取自 config.ini 的 ToggleMapKey
+
+    // 设置窗口用的状态(与 SNMapSettings.ini 同步)
+    private bool showCreatures = true;
+    private bool showScanSignals = true;
+    private int minimapPixels = 360;
+    private readonly List<string> species = new List<string>();   // 模块见过的敌对物种(TechType 名)
+    private SNMapSettingsForm settingsDlg;
 
     private readonly Pen beaconPen = new Pen(Color.FromArgb(200, 10, 10, 10), 2f);
     private readonly Pen scalePen = new Pen(Color.White, 3f);
@@ -179,35 +185,13 @@ public class MapForm : Form
         chkTop.CheckedChanged += delegate { TopMost = chkTop.Checked; };
         Controls.Add(chkTop);
 
-        Label lmini = new Label();
-        lmini.Text = "小地图:";
-        lmini.Location = new Point(140, 46);
-        lmini.AutoSize = true;
-        lmini.ForeColor = ThemeText;
-        Controls.Add(lmini);
-
-        txtMini = new TextBox();
-        txtMini.Location = new Point(198, 42);
-        txtMini.Size = new Size(48, 24);
-        Controls.Add(txtMini);
-
-        btnApply = BlueBtn("应用", 250, 41, 48, 26);
-        btnApply.Click += delegate { ApplyMiniSize(); };
-        Controls.Add(btnApply);
-
-        chkCreatures = new CheckBox();
-        chkCreatures.Text = "攻击性生物";
-        chkCreatures.Checked = true;
-        chkCreatures.Location = new Point(306, 44);
-        chkCreatures.AutoSize = true;
-        chkCreatures.CheckedChanged += delegate
-        {
-            WriteSettingsKey("ShowCreatures", chkCreatures.Checked ? "1" : "0");
-        };
-        Controls.Add(chkCreatures);
+        // 小地图大小 / 敌对生物总开关 / 扫描目标开关 / 按物种显示隐藏, 全部收进【设置】窗口
+        btnSettings = BlueBtn("设置", 140, 41, 60, 26);
+        btnSettings.Click += delegate { OpenSettings(); };
+        Controls.Add(btnSettings);
 
         lblInfo = new Label();
-        lblInfo.Location = new Point(410, 46);
+        lblInfo.Location = new Point(212, 46);
         lblInfo.AutoSize = true;
         lblInfo.ForeColor = ThemeAccentDark;
         lblInfo.Font = smallFont;
@@ -216,6 +200,7 @@ public class MapForm : Form
         Controls.Add(btnPrev);
         Controls.Add(btnNext);
         Controls.Add(btnExit);
+        Controls.Add(btnSettings);
         Controls.Add(lblLayer);
 
         LoadLayers();
@@ -438,18 +423,161 @@ public class MapForm : Form
         catch (Exception) { }
     }
 
-    private void ApplyMiniSize()
+    // 设置窗口(非模态, 打开时可继续看图; 再次点【设置】会把窗口提到前面)
+    private void OpenSettings()
     {
-        int v;
-        if (!int.TryParse(txtMini.Text.Trim(), out v))
+        if (settingsDlg == null || settingsDlg.IsDisposed)
         {
-            MessageBox.Show(this, "请输入数字, 例如 360", "SNMap", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
+            settingsDlg = new SNMapSettingsForm(this);
+            settingsDlg.Show(this);
         }
-        v = ClampI(v, 120, 800);
-        txtMini.Text = v.ToString();
-        WriteSettingsKey("MinimapPixels", v.ToString());
+        else
+        {
+            if (!settingsDlg.Visible) settingsDlg.Show();
+            settingsDlg.BringToFront();
+            settingsDlg.Activate();
+        }
     }
+
+    // 供设置窗口读写(值都落在 SNMapSettings.ini 上, 模块 3 帧就轮询一次, 实时生效)
+    public int MinimapPixels
+    {
+        get { return minimapPixels; }
+        set
+        {
+            minimapPixels = ClampI(value, 120, 800);
+            WriteSettingsKey(Proto.KeyMinimapPixels, minimapPixels.ToString());
+        }
+    }
+
+    public bool ShowCreaturesSetting
+    {
+        get { return showCreatures; }
+        set
+        {
+            showCreatures = value;
+            WriteSettingsKey(Proto.KeyShowCreatures, value ? "1" : "0");
+        }
+    }
+
+    public bool ShowScanSignalsSetting
+    {
+        get { return showScanSignals; }
+        set
+        {
+            showScanSignals = value;
+            WriteSettingsKey(Proto.KeyShowScanSignals, value ? "1" : "0");
+        }
+    }
+
+    // 物种清单 = 内置全量表 ∪ 模块报回来的(按 TechType 名去重, 名字带中文注释的用中文显示)
+    public List<string> SpeciesNames()
+    {
+        List<string> res = new List<string>();
+        for (int i = 0; i < BuiltinSpecies.Length; i++) res.Add(BuiltinSpecies[i][0]);
+        for (int i = 0; i < species.Count; i++)
+        {
+            if (!res.Contains(species[i])) res.Add(species[i]);
+        }
+        return res;
+    }
+
+    public string SpeciesLabel(string techType)
+    {
+        for (int i = 0; i < BuiltinSpecies.Length; i++)
+        {
+            if (BuiltinSpecies[i][0] == techType) return techType + "  " + BuiltinSpecies[i][1];
+        }
+        return techType;
+    }
+
+    // 当前勾选"要显示"的物种; 没有该设置时回落到 config.ini 白名单(与模块逻辑一致)
+    public List<string> CurrentShownSpecies()
+    {
+        List<string> res = new List<string>();
+        try
+        {
+            Dictionary<string, string> d = Proto.ParseIniStrings(SettingsPath());
+            string s;
+            if (d.TryGetValue(Proto.KeyCreatureShow, out s))
+            {
+                string t = s.Trim();
+                if (t == "*")
+                {
+                    res.AddRange(SpeciesNames());
+                    return res;
+                }
+                string[] parts = t.Split(new char[] { ',', ';' });
+                for (int i = 0; i < parts.Length; i++)
+                {
+                    string nm = parts[i].Trim();
+                    if (nm.Length > 0 && !res.Contains(nm)) res.Add(nm);
+                }
+                return res;
+            }
+        }
+        catch (Exception) { }
+        // 回落: config.ini 的 CreatureWhitelist / 模块默认白名单
+        List<string> dw = new List<string>();
+        try
+        {
+            string cfg = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.ini");
+            Dictionary<string, string> cd = Proto.ParseIniStrings(cfg);
+            string cs;
+            if (cd.TryGetValue("CreatureWhitelist", out cs))
+            {
+                string[] parts = cs.Split(new char[] { ',', ';' });
+                for (int i = 0; i < parts.Length; i++)
+                {
+                    string nm = parts[i].Trim();
+                    if (nm.Length > 0 && !dw.Contains(nm)) dw.Add(nm);
+                }
+                return dw;
+            }
+        }
+        catch (Exception) { }
+        for (int i = 0; i < BuiltinSpecies.Length; i++)
+        {
+            if (BuiltinSpecies[i].Length > 2 && BuiltinSpecies[i][2] == "1") dw.Add(BuiltinSpecies[i][0]);
+        }
+        return dw;
+    }
+
+    public void WriteShownSpecies(List<string> shown)
+    {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < shown.Count; i++)
+        {
+            if (sb.Length > 0) sb.Append(',');
+            sb.Append(shown[i]);
+        }
+        WriteSettingsKey(Proto.KeyCreatureShow, sb.ToString());
+    }
+
+    // 内置敌对生物全量表: [TechType 名, 中文, 默认是否显示("1"=大型默认开)]
+    private static readonly string[][] BuiltinSpecies = new string[][]
+    {
+        new string[] { "BoneShark", "骨鲨", "1" },
+        new string[] { "Sandshark", "沙鲨", "1" },
+        new string[] { "Stalker", "潜行者", "1" },
+        new string[] { "Crabsnake", "蟹蛇", "1" },
+        new string[] { "CrabSquid", "蟹鱿", "1" },
+        new string[] { "Warper", "织命者", "1" },
+        new string[] { "Shocker", "电鳗", "1" },
+        new string[] { "SpineEel", "暗礁鳗", "1" },
+        new string[] { "ReaperLeviathan", "死神利维坦", "1" },
+        new string[] { "GhostLeviathan", "幽灵利维坦", "1" },
+        new string[] { "GhostLeviatanVoid", "虚空幽灵利维坦", "1" },
+        new string[] { "SeaDragon", "海龙利维坦", "1" },
+        new string[] { "Crash", "自爆鱼", "0" },
+        new string[] { "Biter", "咬咬鱼", "0" },
+        new string[] { "Blighter", "盲鳗", "0" },
+        new string[] { "CaveCrawler", "洞穴爬行者", "0" },
+        new string[] { "Mesmer", "催眠鱼", "0" },
+        new string[] { "LavaLizard", "熔岩蜥蜴", "0" },
+        new string[] { "LavaLarva", "熔岩幼虫", "0" },
+        new string[] { "Bleeder", "水蛭", "0" }
+    };
 
     // ------------------------------------------------------------- state read + tick
 
@@ -544,7 +672,7 @@ public class MapForm : Form
                 bk.Label = GetString(buf, off + 16, off + 20, 63);
                 beacons.Add(bk);
             }
-            int cn = ClampI(GetInt(buf, OffCreatureCount), 0, 24);
+            int cn = ClampI(GetInt(buf, OffCreatureCount), 0, Proto.MaxCreatures);
             for (int i = 0; i < cn; i++)
             {
                 int off = OffCreatures + i * 80;
@@ -553,6 +681,14 @@ public class MapForm : Form
                 c.Z = GetFloat(buf, off + 4);
                 c.Label = GetString(buf, off + 8, off + 12, 66);
                 creatureWin.Add(c);
+            }
+            // 模块见过的敌对物种清单(设置窗口右侧列表用)
+            int sn = ClampI(GetInt(buf, Proto.OffSpeciesCount), 0, Proto.MaxSpecies);
+            for (int i = 0; i < sn; i++)
+            {
+                int so = Proto.OffSpecies + i * Proto.SpeciesStride;
+                string nm = GetString(buf, so, so + 4, Proto.SpeciesStride - 4);
+                if (nm.Length > 0 && !species.Contains(nm)) species.Add(nm);
             }
             noStateTicks = 0;
         }
@@ -586,12 +722,13 @@ public class MapForm : Form
                 if (wantShow && !Visible) ShowToFront();
                 if (!wantShow && Visible) Hide();
             }
-            if (d.TryGetValue("MinimapPixels", out s))
+            if (d.TryGetValue(Proto.KeyMinimapPixels, out s))
             {
                 int v;
-                if (int.TryParse(s, out v) && v >= 120 && v <= 800) txtMini.Text = v.ToString();
+                if (int.TryParse(s, out v) && v >= 120 && v <= 800) minimapPixels = v;
             }
-            if (d.TryGetValue("ShowCreatures", out s)) chkCreatures.Checked = s != "0";
+            if (d.TryGetValue(Proto.KeyShowCreatures, out s)) showCreatures = s != "0";
+            if (d.TryGetValue(Proto.KeyShowScanSignals, out s)) showScanSignals = s != "0";
         }
         catch (Exception) { }
     }
@@ -784,7 +921,7 @@ public class MapForm : Form
                 g.Restore(state);
             }
 
-            if (chkCreatures != null && chkCreatures.Checked)
+            if (showCreatures)
             {
                 foreach (CreaturePt c in creatureWin)
                 {

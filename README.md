@@ -5,7 +5,7 @@ A trainer-style minimap & standalone map window for **Subnautica (Steam, x64)**.
 
 > 仅用于单人游戏与学习交流。请勿用于任何联机对抗场景。
 
-当前版本：**v2.4**
+当前版本：**v2.5**
 
 ## 坐标系约定（改代码必读）
 
@@ -18,7 +18,8 @@ A trainer-style minimap & standalone map window for **Subnautica (Steam, x64)**.
 
 - 左上角实时坐标：`X / Z / 深度 / 朝向(8向) / 生物群系(中文)`（朝向取自渲染相机）
 - **F7** 圆形小地图：`200m → 300m → 500m → 1000m → 关 → 200m` 循环，以玩家为中心，红箭头=玩家朝向，彩点=信标/生命舱，橙点+名字=扫描室正在扫描的信号，顶部 N 指北；“关”档整块小地图隐藏（含信号点），只留一行 `小地图: 关 [F7 开启]` 提示
-- **F9** 独立大地图窗口（`SNMapWindow.exe`，默认最大化）：按一下把窗口**抬到游戏画面最前**且不抢游戏焦点（所以再按 F9 依然关得掉）；滚轮缩放（以鼠标为中心，最高 16x）、左键拖动平移、双击回到跟随；**顶部 `－`/`＋` 按钮切换地图图层**，小地图跟随当前图层；窗口内可调 跟随 / 置顶 / 小地图像素 / 攻击性生物开关
+- **F9** 独立大地图窗口（`SNMapWindow.exe`，默认最大化）：按一下把窗口**抬到游戏画面最前**且不抢游戏焦点（所以再按 F9 依然关得掉）；滚轮缩放（以鼠标为中心，最高 16x）、左键拖动平移、双击回到跟随；**顶部 `－`/`＋` 按钮切换地图图层**，小地图跟随当前图层；窗口内可调 跟随 / 置顶
+- **顶部【设置】窗口**（v2.5）：左侧三个总开关 —— 小地图大小 / 显示敌对生物 / 显示扫描室扫描目标；右侧 = 全部敌对生物逐个勾选（勾上显示、去掉隐藏），列表 = 内置已知物种 ∪ 游戏里实际遇到过的物种（模块把见过的 TechType 名单写进状态文件）。改动写进 `SNMapSettings.ini`，模块 ~0.1 秒轮询一次，**立即生效、不用重新注入**
 - 多图层：`maps/` 文件夹里的每张 png/jpg 都是一个图层（主地图、失落之河、蛇菇洞、熔岩堡、海皇监狱、利维坦分布等），大地图小地图同步切换
 - 游戏更新一般无需重做：坐标直接读游戏对象（`Player.main` 等），**不使用内存偏移**
 
@@ -52,7 +53,7 @@ A trainer-style minimap & standalone map window for **Subnautica (Steam, x64)**.
 | MinimapSpans | 200,300,500,1000 | 小地图档位（米），逗号分隔；F7 循环末尾固定追加“关”档 |
 | CreatureWhitelist | 11 种大型敌对生物 | 大地图红三角白名单（TechType 名逗号分隔）；删掉该行 = 显示全部攻击性生物 |
 
-大地图窗口与模块之间另有一份 `SNMapSettings.ini`（`ShowWindow` / `MinimapPixels` / `ShowCreatures` / `WindowLayer`），由窗口写、模块读，不需要手改。
+大地图窗口与模块之间另有一份 `SNMapSettings.ini`（`ShowWindow` / `MinimapPixels` / `ShowCreatures` / `ShowScanSignals` / `CreatureShow` / `WindowLayer`），由窗口写、模块读，不需要手改。其中 `CreatureShow` 是设置窗口勾选出来的"要显示的物种"清单（TechType 名逗号分隔，`*`=全部，空=全不显示）；没有这个键时，模块回落到 `config.ini` 的 `CreatureWhitelist`。
 
 ## 构建与发布包 Build
 

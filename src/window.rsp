@@ -4,4 +4,5 @@
 -r:System.Drawing.dll
 -out:..\SNMapWindow.exe
 SNMapWindow.cs
+SNMapSettingsForm.cs
 SNMapShared.cs
