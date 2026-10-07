@@ -46,6 +46,7 @@ namespace SNMap
         public static float WorldRange = 2000f;
         public static int MinimapPixels = 360;
         public static float[] MinimapSpans = new float[] { 200f, 300f, 500f, 1000f };
+        public static List<TechType> CreatureWhitelist;   // null=显示全部攻击性生物
         public static string BaseDir = ".";
 
         public static void Init()
@@ -68,8 +69,13 @@ namespace SNMap
                 sb.AppendLine("FontSize=" + FontSize);
                 sb.AppendLine("WorldRange=" + WorldRange.ToString("0", CultureInfo.InvariantCulture));
                 sb.AppendLine("MinimapPixels=" + MinimapPixels);
-                sb.AppendLine("# 小地图各档显示范围(米), 逗号分隔, F7 循环: 关->第1档->...");
+                sb.AppendLine("# 小地图各档显示范围(米), 逗号分隔, F7 循环: 200->300->500->1000->200");
                 sb.AppendLine("MinimapSpans=200,300,500,1000");
+                sb.AppendLine("# 攻击性生物白名单(大地图红三角只显示这些), TechType 名逗号分隔, 删掉本行=全部显示");
+                sb.AppendLine("# 大型: BoneShark Sandshark Stalker Crabsnake CrabSquid Warper Shocker SpineEel");
+                sb.AppendLine("#       ReaperLeviathan GhostLeviathan GhostLeviatanVoid SeaDragon");
+                sb.AppendLine("# 小型: Crash Biter Blighter CaveCrawler Mesmer LavaLizard LavaLarva Bleeder");
+                sb.AppendLine("CreatureWhitelist=BoneShark,Sandshark,Stalker,Crabsnake,CrabSquid,Warper,Shocker,ReaperLeviathan,GhostLeviathan,GhostLeviatanVoid,SeaDragon");
                 try { File.WriteAllText(path, sb.ToString()); } catch (Exception) { }
                 return;
             }
@@ -103,6 +109,22 @@ namespace SNMap
                                         fs.Add(f);
                                 }
                                 if (fs.Count > 0) MinimapSpans = fs.ToArray();
+                                break;
+                            }
+                        case "CreatureWhitelist":
+                            {
+                                List<TechType> ts = new List<TechType>();
+                                string[] cw = val.Split(new char[] { ',', ';' });
+                                for (int k = 0; k < cw.Length; k++)
+                                {
+                                    try
+                                    {
+                                        TechType tt = (TechType)Enum.Parse(typeof(TechType), cw[k].Trim(), true);
+                                        ts.Add(tt);
+                                    }
+                                    catch (Exception) { }
+                                }
+                                CreatureWhitelist = ts.Count > 0 ? ts : null;
                                 break;
                             }
                     }
@@ -149,7 +171,7 @@ namespace SNMap
         private GUIStyle hudStyle;
         private GUIStyle smallStyle;
         private GUIStyle miniSignalStyle;
-        private int minimapIdx = 1;
+        private int minimapIdx = 0;   // MinimapSpans 下标, F7 纯循环(无关闭档)
         private List<MapLayer> layers = new List<MapLayer>();
         private FieldInfo pingsDictField;
         private FieldInfo pingColorsField;
@@ -208,7 +230,7 @@ namespace SNMap
             }
             if (Enum.TryParse(Cfg.ToggleHudKey, true, out kc) && Input.GetKeyDown(kc))
             {
-                minimapIdx = (minimapIdx + 1) % (Cfg.MinimapSpans.Length + 1);
+                minimapIdx = (minimapIdx + 1) % Cfg.MinimapSpans.Length;
             }
 
             frame++;
@@ -436,6 +458,12 @@ namespace SNMap
                 {
                     if (c == null || !c.gameObject.activeInHierarchy) continue;
                     if (c.GetComponent<AggressiveWhenSeeTarget>() == null && c.GetComponent<AttackLastTarget>() == null) continue;
+                    // 白名单过滤(config.ini CreatureWhitelist, 空=全部)
+                    if (Cfg.CreatureWhitelist != null)
+                    {
+                        TechTag tg = c.GetComponent<TechTag>();
+                        if (tg == null || !Cfg.CreatureWhitelist.Contains(tg.type)) continue;
+                    }
                     if ((c.transform.position - pp).sqrMagnitude > 360000f) continue;
                     aggr.Add(c);
                 }
@@ -511,7 +539,7 @@ namespace SNMap
             }
             LabelShadowed(new Rect(16, 12, 1200, 60), line, hudStyle);
 
-            if (minimapIdx > 0)
+            if (Cfg.MinimapSpans.Length > 0)
             {
                 MapLayer ml = MinimapLayer();
                 if (ml != null && GetTex(ml) != null)
@@ -643,7 +671,7 @@ namespace SNMap
         {
             float D = Mathf.Min(Cfg.MinimapPixels, Screen.height - 80f);
             Rect sq = new Rect(16f, 48f, D, D);
-            float spanWorld = Cfg.MinimapSpans[Mathf.Clamp(minimapIdx - 1, 0, Cfg.MinimapSpans.Length - 1)];
+            float spanWorld = Cfg.MinimapSpans[Mathf.Clamp(minimapIdx, 0, Cfg.MinimapSpans.Length - 1)];
             float su = spanWorld / (L.MaxX - L.MinX);
             float sv = spanWorld / (L.MaxZ - L.MinZ);
 

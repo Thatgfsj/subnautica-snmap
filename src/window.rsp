@@ -1,4 +1,7 @@
 -target:winexe -platform:x64 -optimize+ -codepage:65001 -nowarn:1701,1702,0618,0649
+-r:System.dll
+-r:System.Windows.Forms.dll
+-r:System.Drawing.dll
 -out:..\SNMapWindow.exe
 SNMapWindow.cs
 SNMapShared.cs

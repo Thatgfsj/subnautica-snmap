@@ -136,6 +136,8 @@ public class MapForm : Form
         ClientSize = new Size(940, 920);
         MinimumSize = new Size(520, 420);
         StartPosition = FormStartPosition.CenterScreen;
+        WindowState = FormWindowState.Maximized;   // 默认全屏(可还原)
+        MaximizeBox = true;
         BackColor = ThemeBg;
         DoubleBuffered = true;
 
@@ -145,6 +147,7 @@ public class MapForm : Form
         btnPrev = BlueBtn("－", 8, 8, 40, 30);
         btnNext = BlueBtn("＋", 306, 8, 40, 30);
         btnExit = BlueBtn("退出", ClientSize.Width - 78, 8, 70, 30);
+        btnExit.Anchor = AnchorStyles.Top | AnchorStyles.Right;   // 最大化后仍贴右上角
         lblLayer = new Label();
         lblLayer.Location = new Point(56, 13);
         lblLayer.Size = new Size(242, 24);
