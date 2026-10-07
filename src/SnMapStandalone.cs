@@ -146,7 +146,7 @@ namespace SNMap
         private Texture2D arrowTex;
         private Texture2D dotTex;
         private Texture2D panelTex;
-        private Texture2D circleMask;
+        private Texture2D ringTex;
         private Font uiFont;
         private bool uiFontCjk;
         private GUIStyle hudStyle;
@@ -215,7 +215,7 @@ namespace SNMap
             BuildArrowTexture();
             BuildDotTexture();
             BuildPanelTexture();
-            BuildCircleMask(Cfg.MinimapPixels);
+            BuildRingTexture(Cfg.MinimapPixels);
             LoadLayers();
             LoadPingsApi();
 
@@ -546,10 +546,26 @@ namespace SNMap
             float vc = (p.z - L.MinZ) / (L.MaxZ - L.MinZ);
             float u0 = Mathf.Clamp(uc - su * 0.5f, 0f, 1f - su);
             float v0 = Mathf.Clamp(vc - sv * 0.5f, 0f, 1f - sv);
-            Rect uvRect = new Rect(u0, 1f - (v0 + sv), su, sv);
-
-            GUI.DrawTextureWithTexCoords(sq, L.Tex, uvRect, false);
-            if (circleMask != null) GUI.DrawTexture(sq, circleMask);
+            // 圆形小地图: 逐列切片绘制, 圆外完全透明(露出游戏画面), 无方形黑角
+            float cx = D * 0.5f, cy = D * 0.5f, R = D * 0.5f;
+            int cols = (int)D;
+            for (int c = 0; c < cols; c++)
+            {
+                float dx = c + 0.5f - cx;
+                float halfSq = R * R - dx * dx;
+                if (halfSq <= 0.25f) continue;
+                float half = Mathf.Sqrt(halfSq);
+                if (half < 1f) half = 1f;
+                float yy = cy - half;
+                float hh = half * 2f;
+                float u = u0 + (c / D) * su;
+                float vTop = v0 + (yy / D) * sv;
+                float vBot = v0 + ((yy + hh) / D) * sv;
+                Rect uvr = new Rect(u, 1f - vBot, su / D, vBot - vTop);
+                Rect sr = new Rect(sq.x + c, sq.y + yy, 1.05f, hh);
+                GUI.DrawTextureWithTexCoords(sr, L.Tex, uvr, false);
+            }
+            if (ringTex != null) GUI.DrawTexture(sq, ringTex);
 
             Color[] colors = GetPingColors();
             List<PingInstance> list = GetPings();
@@ -565,7 +581,7 @@ namespace SNMap
                     if (Mathf.Abs(dx) > halfX || Mathf.Abs(dz) > halfZ) continue;
                     float sx = sq.x + (0.5f + dx / spanWorld) * D;
                     float sy = sq.y + (0.5f + dz / spanWorld) * D;
-                    if (Vector2.Distance(new Vector2(sx, sy), sq.center) > D * 0.5f - 8f) continue;
+                    if (Vector2.Distance(new Vector2(sx, sy), sq.center) > D * 0.5f - 13f) continue;
                     int ci = pi.colorIndex >= 0 ? pi.colorIndex : 0;
                     GUI.color = colors[ci % colors.Length];
                     GUI.DrawTexture(new Rect(sx - 5f, sy - 5f, 10f, 10f), dotTex);
@@ -845,32 +861,49 @@ namespace SNMap
             }
         }
 
-        private void BuildCircleMask(int D)
+        // 黑-银-黑 金属描边圆环, 圆内外均透明
+        private void BuildRingTexture(int D)
         {
             try
             {
                 Color32[] px = new Color32[D * D];
                 float c = (D - 1) * 0.5f;
                 float R = D * 0.5f;
-                Color32 hole = new Color32(0, 0, 0, 0);
-                Color32 ring = new Color32(0, 0, 0, 235);
-                Color32 plate = new Color32(10, 12, 20, 255);
+                Color32 trans = new Color32(0, 0, 0, 0);
+                Color32 blackOut = new Color32(5, 5, 8, 255);
+                Color32 blackIn = new Color32(16, 16, 20, 255);
                 for (int y = 0; y < D; y++)
                 {
                     for (int x = 0; x < D; x++)
                     {
                         float dx = x - c, dy = y - c;
                         float d = Mathf.Sqrt(dx * dx + dy * dy);
-                        px[y * D + x] = d <= R - 3f ? hole : (d <= R + 1f ? ring : plate);
+                        Color32 col = trans;
+                        if (d <= R + 0.5f && d >= R - 9.5f)
+                        {
+                            if (d >= R - 3f) col = blackOut;       // 外圈黑
+                            else if (d >= R - 6f)
+                            {
+                                // 银色: 顶部亮 -> 底部暗, 金属渐变
+                                byte s = (byte)(208 - 52 * y / (D - 1));
+                                col = new Color32(s, (byte)(s + 4), (byte)(s + 14), 255);
+                            }
+                            else col = blackIn;                     // 内圈黑
+                            if (d > R - 0.5f)
+                                col.a = (byte)(255f * Mathf.Clamp(R + 0.5f - d, 0f, 1f));
+                            if (d < R - 8.5f)
+                                col.a = (byte)(255f * Mathf.Clamp(d - (R - 9.5f), 0f, 1f));
+                        }
+                        px[y * D + x] = col;
                     }
                 }
-                circleMask = new Texture2D(D, D, TextureFormat.RGBA32, false);
-                circleMask.SetPixels32(px);
-                circleMask.Apply();
+                ringTex = new Texture2D(D, D, TextureFormat.RGBA32, false);
+                ringTex.SetPixels32(px);
+                ringTex.Apply();
             }
             catch (Exception ex)
             {
-                Cfg.Log("circle mask failed: " + ex.Message);
+                Cfg.Log("ring texture failed: " + ex.Message);
             }
         }
 
