@@ -116,6 +116,7 @@ public class MapForm : Form
     private readonly List<string> species = new List<string>();   // 模块见过的敌对物种(TechType 名)
     private SNMapSettingsForm settingsDlg;
     private byte[] stateReadBuf;                                  // 复用: 不再每 tick new 8KB
+    private int wantShowByte = -1;                                // 上一次看到的"模块期望显示"字节
     private readonly List<Beacon> beaconFree = new List<Beacon>();       // 复用池(不参与绘制)
     private readonly List<CreaturePt> creatureFree = new List<CreaturePt>();
 
@@ -349,6 +350,9 @@ public class MapForm : Form
         viewCX = 0; viewCZ = 0;
         // 启动就把当前图层写回设置文件: 模块的小地图跟随这个索引(也决定它去加载哪个 SNMapMini_*.jpg 预览)
         WriteSettingsKey(Proto.KeyWindowLayer, layerIdx.ToString());
+        WinLog("start auto=" + Program.AutoStart + " layers=" + layers.Count + " layer=" + layerIdx +
+               " minimap=" + minimapPixels + " creatures=" + showCreatures + " scan=" + showScanSignals +
+               " from=" + AppDomain.CurrentDomain.BaseDirectory);
     }
 
     // mip 金字塔: 原图 -> 2048 -> 1024 -> ... 一次性预缩放, 之后每帧只做块拷贝
@@ -430,6 +434,7 @@ public class MapForm : Form
                     }
                 }
                 else bmp.Save(outp, ImageFormat.Jpeg);
+                WinLog("preview exported " + Path.GetFileName(outp) + " " + w + "x" + h);
             }
         }
         catch (Exception) { }
@@ -461,15 +466,38 @@ public class MapForm : Form
 
     private void WriteSettingsKey(string key, string val)
     {
+        // 重试几次: 模块每 100ms 也会读这个文件, 撞上共享冲突时静默失败过一次,
+        // 玩家看到的就是"某个设置怎么都不生效"
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                string p = SettingsPath();
+                Dictionary<string, string> d = Proto.ParseIniStrings(p);
+                d[key] = val;
+                List<string> outLines = new List<string>();
+                foreach (KeyValuePair<string, string> kv in d) outLines.Add(kv.Key + "=" + kv.Value);
+                File.WriteAllLines(p, outLines.ToArray());
+                settingsStamp = DateTime.MinValue;
+                return;
+            }
+            catch (Exception ex)
+            {
+                if (attempt == 2) WinLog("write settings failed: " + key + "=" + val + " (" + ex.Message + ")");
+                System.Threading.Thread.Sleep(15);
+            }
+        }
+    }
+
+    // 窗口自己的日志(模块那份是 SNMap.log, 这份是 SNMapWindow.log):
+    // 之前"按 F9 打不开大地图"就是因为窗口侧完全没有可查的记录
+    private static void WinLog(string msg)
+    {
         try
         {
-            string p = SettingsPath();
-            Dictionary<string, string> d = Proto.ParseIniStrings(p);
-            d[key] = val;
-            List<string> outLines = new List<string>();
-            foreach (KeyValuePair<string, string> kv in d) outLines.Add(kv.Key + "=" + kv.Value);
-            File.WriteAllLines(p, outLines.ToArray());
-            settingsStamp = DateTime.MinValue;
+            string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SNMapWindow.log");
+            if (File.Exists(p) && new FileInfo(p).Length > 256 * 1024) File.Delete(p);
+            File.AppendAllText(p, DateTime.Now.ToString("HH:mm:ss") + " " + msg + Environment.NewLine);
         }
         catch (Exception) { }
     }
@@ -713,6 +741,21 @@ public class MapForm : Form
             heading = GetFloat(buf, OffHeading);
             biome = GetString(buf, OffBiomeLen, OffBiome, 64);
 
+            // 显示/隐藏的决定权交给状态文件里模块写的那一字节:
+            //   设置文件那条路依赖"文件时间戳变了没有", 而模块(F9)和窗口(设置项)都会写它,
+            //   时间戳精度/互相覆盖会让 F9 的意图丢掉 —— 就会出现"按 F9 打不开大地图"。
+            //   状态文件是模块 20Hz 写的心跳, 窗口 30Hz 读, 稳。
+            byte sw = buf[OffShowWindow];
+            // 只认"新鲜"的状态文件(游戏真在跑): 游戏退出后文件会留着, 里面的旧字节会把窗口
+            // 一会儿藏一会儿显(启动自检时就撞上了这个)
+            bool fresh = (DateTime.UtcNow - File.GetLastWriteTimeUtc(sp)).TotalSeconds < 3.0;
+            if (fresh && sw != wantShowByte)
+            {
+                wantShowByte = sw;
+                if (sw != 0 && !Visible) { WinLog("show: module F9 -> 1"); ShowToFront(); }
+                else if (sw == 0 && Visible) { WinLog("hide: module F9 -> 0"); Hide(); }
+            }
+
             int n = ClampI(GetInt(buf, OffBeaconCount), 0, Proto.MaxBeacons);
             for (int i = 0; i < n; i++)
             {
@@ -774,9 +817,10 @@ public class MapForm : Form
             string s;
             if (d.TryGetValue("ShowWindow", out s))
             {
+                // 没有 state 文件(游戏没跑)时才由设置文件决定显示; 游戏在跑时以上面那个字节为准
                 bool wantShow = s == "1";
-                if (wantShow && !Visible) ShowToFront();
-                if (!wantShow && Visible) Hide();
+                if (wantShow && !Visible) { WinLog("show: settings ShowWindow=1"); ShowToFront(); }
+                if (!wantShow && Visible) { WinLog("hide: settings ShowWindow=0"); Hide(); }
             }
             if (d.TryGetValue(Proto.KeyMinimapPixels, out s))
             {
