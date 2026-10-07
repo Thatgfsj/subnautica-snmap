@@ -650,6 +650,7 @@ namespace SNMap
         private readonly List<string> scanNodeKey = new List<string>();
         private readonly List<string> scanNodeName = new List<string>();
         private int lastScannerFrame;
+        private int scanErrLogged;
         private bool scannerApiReady;
         private Type riType;                    // ResourceTrackerDatabase/ResourceInfo
         private MethodInfo getNodesM;           // static GetNodes(Vector3,float,TechType,ICollection<ResourceInfo>)
@@ -666,13 +667,29 @@ namespace SNMap
             try
             {
                 MapRoomFunctionality[] rooms = UnityEngine.Object.FindObjectsOfType<MapRoomFunctionality>();
-                if (rooms == null || rooms.Length == 0) return;
-                MapRoomFunctionality room = rooms[0];
+                if (rooms == null || rooms.Length == 0)
+                {
+                    if (frame % 600 == 0) Cfg.Log("scanner: 场景里没找到扫描室");
+                    return;
+                }
+                // 取离玩家最近的那个扫描室(原来直接用 rooms[0]: 有多个房间时会拿错对象)
+                MapRoomFunctionality room = null;
+                float bestD = float.MaxValue;
+                for (int i = 0; i < rooms.Length; i++)
+                {
+                    if (rooms[i] == null) continue;
+                    float d = (rooms[i].transform.position - pp).sqrMagnitude;
+                    if (d < bestD) { bestD = d; room = rooms[i]; }
+                }
+                if (room == null) return;
                 float range = room.GetScanRange();
                 Vector3 rp = room.transform.position;
 
                 List<TechType> types = new List<TechType>();
                 ResourceTrackerDatabase.GetTechTypesInRange(rp, range, types);
+                if (frame % 300 == 0)
+                    Cfg.Log("scanner: rooms=" + rooms.Length + " 最近距离=" + Mathf.RoundToInt(Mathf.Sqrt(bestD)) +
+                            "m range=" + Mathf.RoundToInt(range) + " types=" + types.Count + " nodes=" + scanNodePos.Count);
                 if (types.Count == 0) return;
 
                 if (!scannerApiReady)
@@ -717,7 +734,7 @@ namespace SNMap
             }
             catch (Exception ex)
             {
-                if (frame % 1800 == 0) Cfg.Log("scanner nodes failed: " + ex.Message);
+                if (scanErrLogged < 3) { scanErrLogged++; Cfg.Log("scanner nodes failed: " + ex.Message); }
             }
         }
 
