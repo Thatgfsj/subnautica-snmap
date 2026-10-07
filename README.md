@@ -7,12 +7,19 @@ A trainer-style minimap & standalone map window for **Subnautica (Steam, x64)**.
 
 当前版本：**v2.7**
 
-## 坐标系约定（改代码必读）
 
-- 世界 `+X = 东 = 屏幕右`，`+Z = 北 = 屏幕上`；地图图片上方即北（`MaxZ`），图片行号 `r = (1-v)*H`，`v = (z-MinZ)/(MaxZ-MinZ)`
-- 世界→屏幕：`sx = 窗口西边界 + (wx-winX0)/span*D`，`sy = 窗口南边界 + (1 - (wz-winZ0)/span)*D`
-- 玩家朝向 = 罗盘方位角 `θ = atan2(camera.forward.x, camera.forward.z)`（0=北、90=东、顺时针）；Unity GUI 与 GDI+ 的正角度都是顺时针，两边都直接用 θ
-- 底图与叠加层（箭头/信标/生物）必须用**同一套换算**；小地图贴到图层边缘被 clamp 时，箭头要按窗口原点算、不能钉死在圆心
+## 下载 / Download
+
+**[⬇ 最新发布包 SNMap-v2.7-win64.zip](https://github.com/Thatgfsj/subnautica-snmap/releases/latest)** —— 解压到任意目录（放桌面就行），启动游戏后双击 `SNInjector.exe` 即可。
+发布包内已含全部地图图层、图标包与说明；**仓库内也已包含地图图层（`maps/`）与图标包（`icons/`）**，直接下载本仓库的 zip 同样可用（但仓库不含编译好的 exe/dll，那部分请用 Release 包）。
+
+## 使用
+
+1. 启动游戏（Steam）
+2. 运行 `SNInjector.exe`：**检测到游戏进程后自动注入**（每 1.5 秒探测，游戏重启换 PID 后会再次自动注入；已加载则远程热重载）
+   - 检测不到可点 **[选择窗口]** 手动选窗口，再点 **[注入]**
+3. 大地图窗口（`SNMapWindow.exe`）**不用手动开**：注入成功后引导层会自动拉起它（已在运行则不动），并保持隐藏待命，游戏内按 **F9** 才显示；想手动重开双击它也可以（单实例，会先清掉旧窗口）
+4. 爽用。
 
 ## 功能
 
@@ -25,19 +32,6 @@ A trainer-style minimap & standalone map window for **Subnautica (Steam, x64)**.
 - 多图层：`maps/` 文件夹里的每张 png/jpg 都是一个图层（主地图、失落之河、蛇菇洞、熔岩堡、海皇监狱、利维坦分布等），大地图小地图同步切换
 - 游戏更新一般无需重做：坐标直接读游戏对象（`Player.main` 等），**不使用内存偏移**
 
-## 下载 / Download
-
-**[⬇ 最新发布包 SNMap-v2.7-win64.zip](https://github.com/Thatgfsj/subnautica-snmap/releases/latest)** —— 解压到任意目录（放桌面就行），启动游戏后双击 `SNInjector.exe` 即可。
-发布包内已含全部地图图层、图标包与说明；**仓库内也已包含地图图层（`maps/`）与图标包（`icons/`）**，直接下载本仓库的 zip 同样可用（但仓库不含编译好的 exe/dll，那部分请用 Release 包）。
-> 从 v2.6 升级请**整包替换**：v2.7 升级了模块与窗口之间的协议，只换其中一个会提示"协议不匹配"。
-
-## 使用
-
-1. 启动游戏（Steam）
-2. 运行 `SNInjector.exe`：**检测到游戏进程后自动注入**（每 1.5 秒探测，游戏重启换 PID 后会再次自动注入；已加载则远程热重载）
-   - 检测不到可点 **[选择窗口]** 手动选窗口，再点 **[注入]**
-3. 大地图窗口（`SNMapWindow.exe`）**不用手动开**：注入成功后引导层会自动拉起它（已在运行则不动），并保持隐藏待命，游戏内按 **F9** 才显示；想手动重开双击它也可以（单实例，会先清掉旧窗口）
-4. 绿色提示即成功。**发布包解压到任意目录即可用**，不需要放进游戏目录
 
 ## 图层与标定（maps/）
 
@@ -74,6 +68,13 @@ src/SNMapShared.cs      模块与窗口共享协议/生物群系中文表（编�
 ```
 
 Release 压缩包解压即用（含全部图层与图标包）；仓库内也含 `maps/` 与 `icons/`，只是不含编译好的 exe/dll。
+
+## 坐标系约定
+
+- 世界 `+X = 东 = 屏幕右`，`+Z = 北 = 屏幕上`；地图图片上方即北（`MaxZ`），图片行号 `r = (1-v)*H`，`v = (z-MinZ)/(MaxZ-MinZ)`
+- 世界→屏幕：`sx = 窗口西边界 + (wx-winX0)/span*D`，`sy = 窗口南边界 + (1 - (wz-winZ0)/span)*D`
+- 玩家朝向 = 罗盘方位角 `θ = atan2(camera.forward.x, camera.forward.z)`（0=北、90=东、顺时针）；Unity GUI 与 GDI+ 的正角度都是顺时针，两边都直接用 θ
+- 底图与叠加层（箭头/信标/生物）必须用**同一套换算**；小地图贴到图层边缘被 clamp 时，箭头要按窗口原点算、不能钉死在圆心
 
 ## 实现原理
 
