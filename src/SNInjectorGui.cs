@@ -372,7 +372,12 @@ public class MainForm : Form
                     if (ok)
                     {
                         successPid = selectedPid;
-                        SetStatus("[成功] SNMap 已在游戏内加载!\r\nF9 = 全屏大地图(滚轮缩放, －/＋切换图层)    F7 = 圆形小地图(200/300/500)", Color.Green);
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            Hide();
+                            ShowSplash();
+                            Close();
+                        });
                     }
                     else
                     {
@@ -382,6 +387,61 @@ public class MainForm : Form
             }
             catch (Exception) { }
         });
+    }
+
+    // 注入成功后的提示框: 5 秒自动关闭, 或手动点确定
+    private void ShowSplash()
+    {
+        Form sp = new Form();
+        sp.Text = "SNMap";
+        sp.FormBorderStyle = FormBorderStyle.FixedDialog;
+        sp.StartPosition = FormStartPosition.CenterScreen;
+        sp.ClientSize = new Size(440, 150);
+        sp.MaximizeBox = false;
+        sp.MinimizeBox = false;
+        sp.TopMost = true;
+        sp.BackColor = ThemeBg;
+
+        Label l1 = new Label();
+        l1.Text = "✔ 注入成功!";
+        l1.Font = new Font("Microsoft YaHei UI", 14f, FontStyle.Bold);
+        l1.ForeColor = Color.Green;
+        l1.Location = new Point(20, 14);
+        l1.AutoSize = true;
+        sp.Controls.Add(l1);
+
+        Label l2 = new Label();
+        l2.Text = "游戏内快捷键:   F7 = 圆形小地图       F9 = 大地图窗口";
+        l2.Font = new Font("Microsoft YaHei UI", 10.5f);
+        l2.ForeColor = ThemeText;
+        l2.Location = new Point(22, 58);
+        l2.AutoSize = true;
+        sp.Controls.Add(l2);
+
+        Label l3 = new Label();
+        l3.Text = "5 秒后自动关闭...";
+        l3.Font = new Font("Microsoft YaHei UI", 9f);
+        l3.ForeColor = Color.DimGray;
+        l3.Location = new Point(22, 92);
+        l3.AutoSize = true;
+        sp.Controls.Add(l3);
+
+        Button ok = BlueBtn("确定", 330, 104, 90, ThemeAccent);
+        sp.Controls.Add(ok);
+
+        int left = 5;
+        System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
+        t.Interval = 1000;
+        t.Tick += delegate
+        {
+            left--;
+            if (left <= 0) sp.Close();
+            else l3.Text = left + " 秒后自动关闭...";
+        };
+        t.Start();
+        ok.Click += delegate { sp.Close(); };
+
+        sp.ShowDialog(this);
     }
 
     private delegate bool EnumCb(IntPtr h, IntPtr l);

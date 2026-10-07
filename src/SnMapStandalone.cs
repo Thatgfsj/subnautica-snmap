@@ -1,14 +1,14 @@
-// SNMap 独立版 v1.2 (注入器/修改器方式, 无 BepInEx 依赖)
-// 左上角: 坐标文字 + 圆形小地图(F7 循环 关->200->300->500->关), 与大地图当前图层同步
-// F9: 全屏大地图, 顶部 [－][＋] 切换 maps/ 文件夹里的图层, 解锁光标+屏蔽游戏输入, 滚轮缩放/拖动平移
-// 朝向: 使用渲染相机 MainCamera.camera (Player.main.transform 不随视角旋转!)
-// 底图: maps/ 文件夹下所有 png/jpg, 命名序号决定顺序; maps.ini 可选每层标定: 文件名=minX,maxX,minZ,maxZ
-//       默认标定: 中心=(0,0), 四边=±WorldRange; 未标定的非方形图层仅浏览(不画玩家/信标)
+// SNMap 独立版 v1.3 (注入器/修改器方式, 无 BepInEx 依赖)
+// 游戏内: 左上角坐标文字 + 圆形小地图(F7 循环 200/300/500)
+// F9: 显示/隐藏独立大地图窗口 (SNMapWindow.exe, 通过共享内存 SNMapState 通信)
+// 本模块每帧把 玩家坐标/朝向(相机)/深度/生物群系/信标 写入共享内存供地图窗口读取
+// 朝向: 使用渲染相机 MainCamera.camera (Player.main.transform 不随视角旋转!) + 经验修正180
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.IO.MemoryMappedFiles;
 using System.Reflection;
 using System.Text;
 using UnityEngine;
@@ -137,38 +137,50 @@ namespace SNMap
         public int Width;
         public int Height;
         public float MinX = -2000f, MaxX = 2000f, MinZ = -2000f, MaxZ = 2000f;
-        public bool Calibrated = true;   // false = 仅浏览(不画玩家/信标, 小地图不跟随)
+        public bool Calibrated = true;
         public bool HasIniBounds;
+    }
+
+    // 共享内存布局 (游戏模块写, 地图窗口读; 窗口只写 windowLayer/showWindow 反馈)
+    internal static class SharedState
+    {
+        public const string MmfName = "SNMapState_1";
+        public const int OffMagic = 0;        // int  0x534E4D50
+        public const int OffVersion = 4;      // int  1
+        public const int OffTick = 8;         // long
+        public const int OffPlayerValid = 16; // int
+        public const int OffX = 20;           // float
+        public const int OffY = 24;           // float (深度)
+        public const int OffZ = 28;           // float
+        public const int OffHeading = 32;     // float 角度(顺时针, 0=北)
+        public const int OffShowWindow = 36;  // byte
+        public const int OffBeaconCount = 40; // int
+        public const int OffBiomeLen = 44;    // int
+        public const int OffBiome = 48;       // 64B utf8
+        public const int OffBeacons = 128;    // 32 * 128B: x(0f) z(4f) color(8i) visible(12i) labelLen(16i) label(20+64B)
+        public const int OffWindowLayer = 4224; // int (窗口写: 当前图层索引)
+        public const int OffWorldRange = 4228;  // float (模块写: 默认标定半径)
     }
 
     public class SnMapBehaviour : MonoBehaviour
     {
         private Texture2D arrowTex;
         private Texture2D dotTex;
-        private Texture2D panelTex;
         private Texture2D ringTex;
         private Font uiFont;
         private bool uiFontCjk;
         private GUIStyle hudStyle;
         private GUIStyle smallStyle;
-        private GUIStyle btnStyle;
-        private GUIStyle bigBtnStyle;
-        private bool mapOpen;
-        private int minimapIdx = 1;       // 0=关, 1..N=MinimapSpans 档位, 默认开第1档
+        private int minimapIdx = 1;
         private List<MapLayer> layers = new List<MapLayer>();
-        private int layerIdx;
-        private int lastCalIdx;
-        private float zoom = 1f;
-        private float centerU = 0.5f;
-        private float centerV = 0.5f;
-        private Rect bigMapRect;
-        private bool bigMapRectValid;
-        private Vector2 lastMouseGui = new Vector2(-9999f, -9999f);
-        private CursorLockMode prevLock = CursorLockMode.None;
-        private bool prevVisible = true;
         private FieldInfo pingsDictField;
         private FieldInfo pingColorsField;
         private bool pingWarned;
+
+        private MemoryMappedFile mmf;
+        private MemoryMappedViewAccessor acc;
+        private int frame;
+        private bool showWindow;
 
         private static readonly string[] Headings = new string[]
         {
@@ -214,27 +226,45 @@ namespace SNMap
             LoadFont();
             BuildArrowTexture();
             BuildDotTexture();
-            BuildPanelTexture();
             BuildRingTexture(Cfg.MinimapPixels);
             LoadLayers();
             LoadPingsApi();
+            InitSharedMemory();
+            if (layers.Count > 0) GetTex(layers[0]);
 
-            if (layers.Count > 0)
+            Cfg.Log("SNMap 1.3 awake | layers=" + layers.Count +
+                    " cjk=" + uiFontCjk + " pings=" + (pingsDictField != null) +
+                    " mmf=" + (acc != null) + " bigKey=" + Cfg.ToggleMapKey + " miniKey=" + Cfg.ToggleHudKey);
+        }
+
+        private void InitSharedMemory()
+        {
+            try
             {
-                GetTex(layers[0]);
-                Cfg.Log("SNMap 1.2 awake | layers=" + layers.Count +
-                        " cjk=" + uiFontCjk + " pings=" + (pingsDictField != null) +
-                        " bigKey=" + Cfg.ToggleMapKey + " miniKey=" + Cfg.ToggleHudKey);
+                mmf = MemoryMappedFile.CreateOrOpen(SharedState.MmfName, 8192, MemoryMappedFileAccess.ReadWrite);
+                acc = mmf.CreateViewAccessor();
+                acc.Write(SharedState.OffMagic, (int)0x534E4D50);
+                acc.Write(SharedState.OffVersion, (int)1);
+                acc.Write(SharedState.OffWorldRange, Cfg.WorldRange);
+                // 不清零 showWindow; 若地图窗口已在运行, 保持其可见
+                try
+                {
+                    if (System.Diagnostics.Process.GetProcessesByName("SNMapWindow").Length > 0)
+                        acc.Write(SharedState.OffShowWindow, (byte)1);
+                }
+                catch (Exception) { }
+                Cfg.Log("shared memory ready");
             }
-            else
+            catch (Exception ex)
             {
-                Cfg.Log("SNMap 1.2 awake | NO map layers found!");
+                acc = null;
+                Cfg.Log("shared memory FAILED: " + ex.Message);
             }
         }
 
         private void OnDestroy()
         {
-            try { if (mapOpen) RestoreCursor(); } catch (Exception) { }
+            try { if (acc != null) acc.Write(SharedState.OffPlayerValid, 0); } catch (Exception) { }
         }
 
         private void Update()
@@ -242,82 +272,95 @@ namespace SNMap
             KeyCode kc;
             if (Enum.TryParse(Cfg.ToggleMapKey, true, out kc) && Input.GetKeyDown(kc))
             {
-                mapOpen = !mapOpen;
-                if (mapOpen) FreeCursor(); else RestoreCursor();
-                bigMapRectValid = false;
-                lastMouseGui = new Vector2(-9999f, -9999f);
+                // 读-翻转-写: 与地图窗口共用同一个标志字节, 避免各自覆盖
+                byte cur = 0;
+                if (acc != null) { try { cur = acc.ReadByte(SharedState.OffShowWindow); } catch (Exception) { } }
+                showWindow = cur == 0;
+                if (acc != null)
+                {
+                    try { acc.Write(SharedState.OffShowWindow, (byte)(showWindow ? 1 : 0)); } catch (Exception) { }
+                }
             }
             if (Enum.TryParse(Cfg.ToggleHudKey, true, out kc) && Input.GetKeyDown(kc))
             {
                 minimapIdx = (minimapIdx + 1) % (Cfg.MinimapSpans.Length + 1);
             }
-            if (mapOpen)
-            {
-                try { GameInput.ClearInput(2); } catch (Exception) { }
-                // 游戏每帧都会重新锁鼠标, 必须每帧抢回来
-                try { Cursor.lockState = CursorLockMode.None; Cursor.visible = true; } catch (Exception) { }
-                // 滚轮/拖拽走游戏自己的 Input 通道, 不依赖 IMGUI 事件
-                HandleMapInputRaw();
-            }
+
+            frame++;
+            WriteState();
         }
 
-        // 大地图输入: Input 通道版(Update 内), 不用 IMGUI 事件
-        private void HandleMapInputRaw()
+        private void WriteState()
         {
-            if (!bigMapRectValid) return;
-            Vector3 mp = Input.mousePosition;
-            Vector2 gui = new Vector2(mp.x, Screen.height - mp.y);
-            if (lastMouseGui.x < -1000f) { lastMouseGui = gui; return; }
-            Vector2 delta = gui - lastMouseGui;
-
-            float wheel = 0f;
-            try { wheel = Input.GetAxis("Mouse ScrollWheel"); } catch (Exception) { }
-            if (Mathf.Abs(wheel) > 0.0001f && bigMapRect.Contains(gui))
+            if (acc == null) return;
+            try
             {
-                float spanU = 1f / zoom, spanV = 1f / zoom;
-                float mu = centerU - spanU * 0.5f + (gui.x - bigMapRect.x) / bigMapRect.width * spanU;
-                float mv = centerV - spanV * 0.5f + (gui.y - bigMapRect.y) / bigMapRect.height * spanV;
-                float oldZoom = zoom;
-                zoom = Mathf.Clamp(zoom * (wheel > 0f ? 1.25f : 0.8f), 1f, 16f);
-                if (zoom != oldZoom)
+                if (frame % 2 != 0) return; // ~30Hz
+                Player pl = Player.main;
+                if (pl == null || pl.transform == null)
                 {
-                    float nu = 1f / zoom, nv = 1f / zoom;
-                    centerU = mu + (centerU - mu) * (nu / spanU);
-                    centerV = mv + (centerV - mv) * (nv / spanV);
+                    acc.Write(SharedState.OffPlayerValid, 0);
+                    return;
+                }
+                Vector3 p = pl.transform.position;
+                acc.Write(SharedState.OffTick, (long)Environment.TickCount);
+                acc.Write(SharedState.OffPlayerValid, 1);
+                acc.Write(SharedState.OffX, p.x);
+                acc.Write(SharedState.OffY, -p.y);
+                acc.Write(SharedState.OffZ, p.z);
+                acc.Write(SharedState.OffHeading, HeadingAngle());
+
+                if (frame % 30 == 0)
+                {
+                    string biome = null;
+                    try { biome = MapBiome(pl.GetBiomeString()); } catch (Exception) { }
+                    byte[] b = biome == null ? new byte[0] : Encoding.UTF8.GetBytes(biome);
+                    if (b.Length > 63) Array.Resize(ref b, 63);
+                    acc.Write(SharedState.OffBiomeLen, b.Length);
+                    if (b.Length > 0) acc.WriteArray(SharedState.OffBiome, b, 0, b.Length);
+
+                    WriteBeacons(pl);
                 }
             }
-
-            if (Input.GetMouseButton(0) && zoom > 1f && bigMapRect.Contains(gui))
+            catch (Exception ex)
             {
-                float su = 1f / zoom, sv = 1f / zoom;
-                centerU -= delta.x / bigMapRect.width * su;
-                centerV -= delta.y / bigMapRect.height * sv;
-                centerU = Mathf.Clamp(centerU, su * 0.5f, 1f - su * 0.5f);
-                centerV = Mathf.Clamp(centerV, sv * 0.5f, 1f - sv * 0.5f);
+                if (frame % 600 == 0) Cfg.Log("write state failed: " + ex.Message);
             }
-            lastMouseGui = gui;
         }
 
-        private void FreeCursor()
+        private void WriteBeacons(Player pl)
         {
-            try
+            List<PingInstance> list = GetPings();
+            if (list == null) return;
+            Vector3 pp = pl.transform.position;
+            List<PingInstance> sorted = new List<PingInstance>();
+            foreach (PingInstance pi in list)
             {
-                prevLock = Cursor.lockState;
-                prevVisible = Cursor.visible;
-                Cursor.lockState = CursorLockMode.None;
-                Cursor.visible = true;
+                if (pi != null && pi.visible) sorted.Add(pi);
             }
-            catch (Exception) { }
-        }
-
-        private void RestoreCursor()
-        {
-            try
+            sorted.Sort(delegate(PingInstance a, PingInstance b)
             {
-                Cursor.lockState = prevLock;
-                Cursor.visible = prevVisible;
+                Vector3 pa = a.GetPosition(), pb = b.GetPosition();
+                float da = (pa - pp).sqrMagnitude, db = (pb - pp).sqrMagnitude;
+                return da.CompareTo(db);
+            });
+            int n = Mathf.Min(sorted.Count, 32);
+            acc.Write(SharedState.OffBeaconCount, n);
+            for (int i = 0; i < n; i++)
+            {
+                PingInstance pi = sorted[i];
+                Vector3 q = pi.GetPosition();
+                int off = SharedState.OffBeacons + i * 128;
+                acc.Write(off, q.x);
+                acc.Write(off + 4, q.z);
+                acc.Write(off + 8, pi.colorIndex >= 0 ? pi.colorIndex : 0);
+                acc.Write(off + 12, 1);
+                string lbl = pi.GetLabel();
+                byte[] b = string.IsNullOrEmpty(lbl) ? new byte[0] : Encoding.UTF8.GetBytes(lbl);
+                if (b.Length > 63) Array.Resize(ref b, 63);
+                acc.Write(off + 16, b.Length);
+                if (b.Length > 0) acc.WriteArray(off + 20, b, 0, b.Length);
             }
-            catch (Exception) { }
         }
 
         // ---------------------------------------------------------------- OnGUI
@@ -328,46 +371,34 @@ namespace SNMap
             if (pl == null || pl.transform == null) return;
             EnsureStyles();
 
-            if (mapOpen)
-            {
-                // OnGUI 每帧多次, 再抢一次鼠标, 确保渲染前状态正确
-                try { Cursor.lockState = CursorLockMode.None; Cursor.visible = true; } catch (Exception) { }
-            }
-
             Vector3 pos = pl.transform.position;
             float depth = -pos.y;
             try { depth = pl.GetDepth(); } catch (Exception) { }
             string biome = null;
             try { biome = MapBiome(pl.GetBiomeString()); } catch (Exception) { }
 
-            if (!mapOpen)
+            string dir8 = Heading8();
+            string line;
+            if (uiFontCjk)
             {
-                string dir8 = Heading8();
-                string line;
-                if (uiFontCjk)
-                {
-                    line = biome == null
-                        ? string.Format("X {0:F0}   Z {1:F0}   深度 {2:F0}m   {3}", pos.x, pos.z, depth, dir8)
-                        : string.Format("X {0:F0}   Z {1:F0}   深度 {2:F0}m   {3}   {4}", pos.x, pos.z, depth, dir8, biome);
-                }
-                else
-                {
-                    line = biome == null
-                        ? string.Format("X {0:F0}   Z {1:F0}   Depth {2:F0}m   {3}", pos.x, pos.z, depth, dir8)
-                        : string.Format("X {0:F0}   Z {1:F0}   Depth {2:F0}m   {3}   {4}", pos.x, pos.z, depth, dir8, biome);
-                }
-                LabelShadowed(new Rect(16, 12, 1200, 60), line, hudStyle);
-
-                if (minimapIdx > 0)
-                {
-                    MapLayer ml = MinimapLayer();
-                    if (ml != null && GetTex(ml) != null)
-                        DrawMinimap(pl, ml);
-                }
+                line = biome == null
+                    ? string.Format("X {0:F0}   Z {1:F0}   深度 {2:F0}m   {3}", pos.x, pos.z, depth, dir8)
+                    : string.Format("X {0:F0}   Z {1:F0}   深度 {2:F0}m   {3}   {4}", pos.x, pos.z, depth, dir8, biome);
             }
+            else
+            {
+                line = biome == null
+                    ? string.Format("X {0:F0}   Z {1:F0}   Depth {2:F0}m   {3}", pos.x, pos.z, depth, dir8)
+                    : string.Format("X {0:F0}   Z {1:F0}   Depth {2:F0}m   {3}   {4}", pos.x, pos.z, depth, dir8, biome);
+            }
+            LabelShadowed(new Rect(16, 12, 1200, 60), line, hudStyle);
 
-            if (mapOpen)
-                DrawBigMap(pl);
+            if (minimapIdx > 0)
+            {
+                MapLayer ml = MinimapLayer();
+                if (ml != null && GetTex(ml) != null)
+                    DrawMinimap(pl, ml);
+            }
         }
 
         // ------------------------------------------------------------- layers
@@ -419,7 +450,6 @@ namespace SNMap
 
             if (layers.Count == 0)
             {
-                // 兼容旧的 map.png
                 string[] legacy = new string[]
                 {
                     dir != null ? Path.Combine(dir, "map.png") : null,
@@ -468,19 +498,21 @@ namespace SNMap
             return res;
         }
 
-        private MapLayer CurrentLayer()
-        {
-            if (layers.Count == 0) return null;
-            return layers[Mathf.Clamp(layerIdx, 0, layers.Count - 1)];
-        }
-
         private MapLayer MinimapLayer()
         {
-            MapLayer cur = CurrentLayer();
-            if (cur != null && cur.Calibrated && cur.Tex != null) return cur;
-            if (lastCalIdx >= 0 && lastCalIdx < layers.Count) return layers[lastCalIdx];
+            // 优先跟随大地图窗口选中的图层(窗口写索引), 未标定则回退到最近标定层
+            int wIdx = -1;
+            try { if (acc != null) wIdx = acc.ReadInt32(SharedState.OffWindowLayer); } catch (Exception) { }
+            if (wIdx >= 0 && wIdx < layers.Count && layers[wIdx].Calibrated) return layers[wIdx];
+
+            MapLayer cur = layers.Count > 0 ? layers[Mathf.Clamp(layerIdxHint, 0, layers.Count - 1)] : null;
+            if (cur != null && cur.Calibrated) return cur;
+            for (int i = 0; i < layers.Count; i++)
+                if (layers[i].Calibrated) return layers[i];
             return cur;
         }
+
+        private int layerIdxHint;
 
         private Texture2D GetTex(MapLayer L)
         {
@@ -503,9 +535,8 @@ namespace SNMap
                 if (!L.HasIniBounds)
                 {
                     float ar = L.Height > 0 ? (float)L.Width / L.Height : 1f;
-                    L.Calibrated = ar > 0.9f && ar < 1.1f;   // 方形视为全图投影
+                    L.Calibrated = ar > 0.9f && ar < 1.1f;
                 }
-                // 释放其他图层纹理, 控制显存(大图 8192^2 有 256MB)
                 for (int i = 0; i < layers.Count; i++)
                 {
                     if (layers[i] != L && layers[i].Tex != null)
@@ -514,7 +545,6 @@ namespace SNMap
                         layers[i].Tex = null;
                     }
                 }
-                if (L.Calibrated) lastCalIdx = layers.IndexOf(L);
                 return tex;
             }
             catch (Exception ex)
@@ -522,13 +552,6 @@ namespace SNMap
                 Cfg.Log("load layer failed: " + L.Name + " (" + ex.Message + ")");
                 return null;
             }
-        }
-
-        private void SwitchLayer(int delta)
-        {
-            if (layers.Count == 0) return;
-            layerIdx = (layerIdx + delta + layers.Count) % layers.Count;
-            GetTex(layers[layerIdx]);
         }
 
         // ------------------------------------------------------------- minimap
@@ -546,6 +569,7 @@ namespace SNMap
             float vc = (p.z - L.MinZ) / (L.MaxZ - L.MinZ);
             float u0 = Mathf.Clamp(uc - su * 0.5f, 0f, 1f - su);
             float v0 = Mathf.Clamp(vc - sv * 0.5f, 0f, 1f - sv);
+
             // 圆形小地图: 逐列切片绘制, 圆外完全透明(露出游戏画面), 无方形黑角
             float cx = D * 0.5f, cy = D * 0.5f, R = D * 0.5f;
             int cols = (int)D;
@@ -596,212 +620,10 @@ namespace SNMap
             GUI.matrix = old;
 
             LabelShadowed(new Rect(sq.center.x - 20f, sq.y + 4f, 40f, 20f), "N", smallStyle);
-            LabelShadowed(new Rect(sq.x, sq.yMax + 2f, 320f, 22f),
+            LabelShadowed(new Rect(sq.x, sq.yMax + 2f, 340f, 22f),
                 string.Format(uiFontCjk ? "{0}  范围 {1:F0}m  [{2}切换]" : "{0}  range {1:F0}m  [{2}]",
                     L.Name, spanWorld, Cfg.ToggleHudKey),
                 smallStyle);
-        }
-
-        // ------------------------------------------------------------- big map
-
-        private void DrawBigMap(Player pl)
-        {
-            Rect full = new Rect(0f, 0f, Screen.width, Screen.height);
-            GUI.DrawTexture(full, panelTex);
-
-            MapLayer L = CurrentLayer();
-            if (L == null)
-            {
-                GUI.Label(new Rect(20f, 60f, 600f, 40f), "maps 文件夹里没有地图", hudStyle);
-                DrawCloseButton();
-                return;
-            }
-            Texture2D tex = GetTex(L);
-            if (tex == null)
-            {
-                GUI.Label(new Rect(20f, 60f, 700f, 40f), "图层加载失败: " + L.Name, hudStyle);
-                DrawCloseButton();
-                return;
-            }
-
-            // 顶部图层切换条: [－] 名称 (i/N) [＋]
-            float barW = 520f;
-            float barX = (Screen.width - barW) * 0.5f;
-            bool repaint = Event.current != null && Event.current.type == EventType.Repaint;
-            Rect prevR = new Rect(barX, 10f, 56f, 32f);
-            Rect nextR = new Rect(barX + barW - 56f, 10f, 56f, 32f);
-            if (repaint && GUI.Button(prevR, "－", bigBtnStyle)) SwitchLayer(-1);
-            if (repaint && GUI.Button(nextR, "＋", bigBtnStyle)) SwitchLayer(1);
-            LabelShadowed(new Rect(barX + 66f, 14f, barW - 132f, 28f),
-                string.Format("{0}   ({1}/{2}){3}", L.Name, layerIdx + 1, layers.Count,
-                    L.Calibrated ? "" : (uiFontCjk ? "  [未标定·仅浏览]" : "  [browse only]")),
-                hudStyle);
-
-            // 地图绘制区
-            float availW = Screen.width - 16f;
-            float availH = Screen.height - 60f;
-            float side = Mathf.Min(availW, availH);
-            float ar = L.Height > 0 ? (float)L.Width / L.Height : 1f;
-            float drawW = side, drawH = side;
-            if (ar >= 1f) drawH = side / ar; else drawW = side * ar;
-            Rect sq = new Rect((Screen.width - drawW) * 0.5f, 48f + (availH - drawH) * 0.5f, drawW, drawH);
-            bigMapRect = sq;
-            bigMapRectValid = true;
-
-            float spanU = 1f / zoom, spanV = 1f / zoom;
-            centerU = Mathf.Clamp(centerU, spanU * 0.5f, 1f - spanU * 0.5f);
-            centerV = Mathf.Clamp(centerV, spanV * 0.5f, 1f - spanV * 0.5f);
-            Rect uvRect = new Rect(centerU - spanU * 0.5f, 1f - (centerV + spanV * 0.5f), spanU, spanV);
-            GUI.DrawTextureWithTexCoords(sq, tex, uvRect, true);
-
-            if (L.Calibrated)
-            {
-                float u0 = centerU - spanU * 0.5f, v0 = centerV - spanV * 0.5f;
-                DrawPings(L, sq, u0, v0, spanU, spanV);
-                DrawPlayer(L, pl, sq, u0, v0, spanU, spanV);
-                float mPerPx = (L.MaxX - L.MinX) / (sq.width * spanU);
-                if (mPerPx > 0f)
-                {
-                    LabelShadowed(new Rect(sq.x + 10f, sq.y + 8f, 340f, 26f),
-                        string.Format(uiFontCjk ? "比例 1px = {0:F2}m (x{1:F1})" : "scale 1px = {0:F2}m (x{1:F1})", mPerPx, zoom),
-                        smallStyle);
-                }
-            }
-            else
-            {
-                LabelShadowed(new Rect(sq.x + 10f, sq.y + 8f, 560f, 26f),
-                    uiFontCjk ? "该图层未标定世界坐标, 仅浏览 (玩家/信标不显示)"
-                              : "layer not calibrated - view only",
-                    smallStyle);
-            }
-
-            Player p2 = pl;
-            Vector3 p = p2.transform.position;
-            float depth = -p.y;
-            try { depth = p2.GetDepth(); } catch (Exception) { }
-            LabelShadowed(new Rect(14f, Screen.height - 34f, 700f, 26f),
-                string.Format(uiFontCjk ? "X {0:F0}   Z {1:F0}   深度 {2:F0}m" : "X {0:F0}   Z {1:F0}   Depth {2:F0}m", p.x, p.z, depth),
-                smallStyle);
-            LabelShadowed(new Rect(14f, 52f, 700f, 26f),
-                uiFontCjk ? "[" + Cfg.ToggleMapKey + " 关闭]  滚轮缩放  左键拖动平移"
-                          : "[" + Cfg.ToggleMapKey + " close]  wheel=zoom  drag=pan",
-                smallStyle);
-
-            DrawCloseButton();
-        }
-
-        private void DrawCloseButton()
-        {
-            Rect closeR = new Rect(Screen.width - 46f, 10f, 34f, 28f);
-            if (GUI.Button(closeR, "X", btnStyle))
-            {
-                mapOpen = false;
-                RestoreCursor();
-            }
-        }
-
-        // ------------------------------------------------------------- shared draw
-
-        private void DrawPlayer(MapLayer L, Player pl, Rect sq, float u0, float v0, float spanU, float spanV)
-        {
-            if (pl == null || arrowTex == null) return;
-            Vector3 p = pl.transform.position;
-            float mx, my;
-            if (!WorldToWindow(L, p.x, p.z, sq, u0, v0, spanU, spanV, out mx, out my)) return;
-
-            float ang = HeadingAngle();
-            float a = 24f;
-            Matrix4x4 old = GUI.matrix;
-            GUIUtility.RotateAroundPivot(ang, new Vector2(mx, my));
-            GUI.DrawTexture(new Rect(mx - a * 0.5f, my - a * 0.5f, a, a), arrowTex);
-            GUI.matrix = old;
-        }
-
-        private void DrawPings(MapLayer L, Rect sq, float u0, float v0, float spanU, float spanV)
-        {
-            if (dotTex == null) return;
-            try
-            {
-                List<PingInstance> list = GetPings();
-                if (list == null) return;
-                Color[] colors = GetPingColors();
-                for (int i = 0; i < list.Count; i++)
-                {
-                    PingInstance pi = list[i];
-                    if (pi == null || !pi.visible) continue;
-                    Vector3 p = pi.GetPosition();
-                    float mx, my;
-                    if (!WorldToWindow(L, p.x, p.z, sq, u0, v0, spanU, spanV, out mx, out my)) continue;
-
-                    int ci = pi.colorIndex >= 0 ? pi.colorIndex : 0;
-                    GUI.color = colors[ci % colors.Length];
-                    GUI.DrawTexture(new Rect(mx - 7f, my - 7f, 14f, 14f), dotTex);
-                    GUI.color = Color.white;
-
-                    string lbl = pi.GetLabel();
-                    if (!string.IsNullOrEmpty(lbl))
-                        LabelShadowed(new Rect(mx + 9f, my - 10f, 240f, 20f), lbl, smallStyle);
-                }
-            }
-            catch (Exception ex)
-            {
-                if (!pingWarned)
-                {
-                    pingWarned = true;
-                    Cfg.Log("draw pings failed: " + ex.Message);
-                }
-            }
-        }
-
-        private List<PingInstance> GetPings()
-        {
-            try
-            {
-                if (pingsDictField == null) return null;
-                IDictionary dict = pingsDictField.GetValue(null) as IDictionary;
-                if (dict == null) return null;
-                List<PingInstance> list = new List<PingInstance>();
-                foreach (object o in dict.Values)
-                {
-                    PingInstance pi = o as PingInstance;
-                    if (pi != null) list.Add(pi);
-                }
-                return list;
-            }
-            catch (Exception) { return null; }
-        }
-
-        private Color[] GetPingColors()
-        {
-            if (pingColorsField != null)
-            {
-                try
-                {
-                    Color[] opts = pingColorsField.GetValue(null) as Color[];
-                    if (opts != null && opts.Length > 0) return opts;
-                }
-                catch (Exception) { }
-            }
-            return FallbackPingColors;
-        }
-
-        private void LoadPingsApi()
-        {
-            try
-            {
-                pingsDictField = typeof(PingManager).GetField("pings", BindingFlags.NonPublic | BindingFlags.Static);
-                pingColorsField = typeof(PingManager).GetField("colorOptions", BindingFlags.Public | BindingFlags.Static);
-            }
-            catch (Exception) { }
-        }
-
-        private bool WorldToWindow(MapLayer L, float wx, float wz, Rect sq, float u0, float v0, float spanU, float spanV, out float mx, out float my)
-        {
-            float u = (wx - L.MinX) / (L.MaxX - L.MinX);
-            float v = (wz - L.MinZ) / (L.MaxZ - L.MinZ);
-            mx = sq.x + (u - u0) / spanU * sq.width;
-            my = sq.y + (v - v0) / spanV * sq.height;
-            return mx >= sq.x - 24f && my >= sq.y - 24f && mx <= sq.xMax + 24f && my <= sq.yMax + 24f;
         }
 
         // ------------------------------------------------------------- helpers
@@ -861,7 +683,38 @@ namespace SNMap
             }
         }
 
-        // 黑-银-黑 金属描边圆环, 圆内外均透明
+        private List<PingInstance> GetPings()
+        {
+            try
+            {
+                if (pingsDictField == null) return null;
+                IDictionary dict = pingsDictField.GetValue(null) as IDictionary;
+                if (dict == null) return null;
+                List<PingInstance> list = new List<PingInstance>();
+                foreach (object o in dict.Values)
+                {
+                    PingInstance pi = o as PingInstance;
+                    if (pi != null) list.Add(pi);
+                }
+                return list;
+            }
+            catch (Exception) { return null; }
+        }
+
+        private Color[] GetPingColors()
+        {
+            if (pingColorsField != null)
+            {
+                try
+                {
+                    Color[] opts = pingColorsField.GetValue(null) as Color[];
+                    if (opts != null && opts.Length > 0) return opts;
+                }
+                catch (Exception) { }
+            }
+            return FallbackPingColors;
+        }
+
         private void BuildRingTexture(int D)
         {
             try
@@ -881,14 +734,13 @@ namespace SNMap
                         Color32 col = trans;
                         if (d <= R + 0.5f && d >= R - 9.5f)
                         {
-                            if (d >= R - 3f) col = blackOut;       // 外圈黑
+                            if (d >= R - 3f) col = blackOut;
                             else if (d >= R - 6f)
                             {
-                                // 银色: 顶部亮 -> 底部暗, 金属渐变
                                 byte s = (byte)(208 - 52 * y / (D - 1));
                                 col = new Color32(s, (byte)(s + 4), (byte)(s + 14), 255);
                             }
-                            else col = blackIn;                     // 内圈黑
+                            else col = blackIn;
                             if (d > R - 0.5f)
                                 col.a = (byte)(255f * Mathf.Clamp(R + 0.5f - d, 0f, 1f));
                             if (d < R - 8.5f)
@@ -967,13 +819,14 @@ namespace SNMap
             dotTex.Apply();
         }
 
-        private void BuildPanelTexture()
+        private void LoadPingsApi()
         {
-            Color32[] px = new Color32[16];
-            for (int i = 0; i < px.Length; i++) px[i] = new Color32(8, 9, 14, 235);
-            panelTex = new Texture2D(4, 4, TextureFormat.RGBA32, false);
-            panelTex.SetPixels32(px);
-            panelTex.Apply();
+            try
+            {
+                pingsDictField = typeof(PingManager).GetField("pings", BindingFlags.NonPublic | BindingFlags.Static);
+                pingColorsField = typeof(PingManager).GetField("colorOptions", BindingFlags.Public | BindingFlags.Static);
+            }
+            catch (Exception) { }
         }
 
         private void EnsureStyles()
@@ -988,14 +841,6 @@ namespace SNMap
 
             smallStyle = new GUIStyle(hudStyle);
             smallStyle.fontSize = Mathf.Max(12, Cfg.FontSize - 6);
-
-            btnStyle = new GUIStyle(GUI.skin.button);
-            if (uiFont != null) btnStyle.font = uiFont;
-            btnStyle.fontSize = 14;
-
-            bigBtnStyle = new GUIStyle(btnStyle);
-            bigBtnStyle.fontSize = Mathf.Max(16, Cfg.FontSize);
-            bigBtnStyle.alignment = TextAnchor.MiddleCenter;
         }
     }
 }
