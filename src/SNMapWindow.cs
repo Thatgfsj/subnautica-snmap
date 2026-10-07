@@ -107,6 +107,7 @@ public class MapForm : Form
     private TextBox txtMini;
     private Label lblLayer, lblInfo;
     private Font mapFont, smallFont;
+    private Keys toggleKey = Keys.F9;   // 取自 config.ini 的 ToggleMapKey
 
     private readonly Pen beaconPen = new Pen(Color.FromArgb(200, 10, 10, 10), 2f);
     private readonly Pen scalePen = new Pen(Color.White, 3f);
@@ -226,6 +227,13 @@ public class MapForm : Form
                 WriteSettingsKey("ShowWindow", "0");
             }
         };
+
+        // "置顶"默认勾选, 但原来只赋了 chkTop.Checked 没落到窗口属性上(事件是赋值之后才挂的), 所以窗口其实不在最前
+        TopMost = chkTop.Checked;
+
+        toggleKey = LoadToggleKey();
+        KeyPreview = true;
+        KeyDown += new KeyEventHandler(OnFormKeyDown);
 
         System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
         t.Interval = 33;
@@ -548,7 +556,7 @@ public class MapForm : Form
             if (d.TryGetValue("ShowWindow", out s))
             {
                 bool wantShow = s == "1";
-                if (wantShow && !Visible) ShowNoActivate();
+                if (wantShow && !Visible) ShowToFront();
                 if (!wantShow && Visible) Hide();
             }
             if (d.TryGetValue("MinimapPixels", out s))
@@ -561,14 +569,53 @@ public class MapForm : Form
         catch (Exception) { }
     }
 
-    private void ShowNoActivate()
+    // F9 显示: 必须真的抬到最前。原来只调 SW_SHOWNA(只显示不抬升), 会被游戏窗口压在后面。
+    // 关键取舍: 用 SWP_NOACTIVATE 抬升但不抢焦点 —— 一旦抢了游戏的键盘焦点, 游戏就收不到下一次 F9, 反而关不掉地图。
+    private void ShowToFront()
     {
         Show();
-        try { ShowWindow(Handle, 8); } catch (Exception) { }
+        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Maximized;
+        TopMost = chkTop.Checked;   // 让"置顶"勾选真正生效(默认勾选)
+        try
+        {
+            SetWindowPos(Handle, TopMost ? HWND_TOPMOST : HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        }
+        catch (Exception) { }
     }
 
+    private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    private static readonly IntPtr HWND_TOP = IntPtr.Zero;
+    private const int SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOACTIVATE = 0x0010, SWP_SHOWWINDOW = 0x0040;
+
     [DllImport("user32.dll")]
-    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, int uFlags);
+
+    // 窗口自己拿到 F9 说明焦点在窗口上(游戏收不到这个键): 直接写设置文件隐藏自己, 保证"点过地图后按 F9 也能关"
+    private void OnFormKeyDown(object s, KeyEventArgs e)
+    {
+        if (e.KeyCode != toggleKey) return;
+        e.Handled = true;
+        e.SuppressKeyPress = true;
+        WriteSettingsKey("ShowWindow", "0");
+    }
+
+    private Keys LoadToggleKey()
+    {
+        try
+        {
+            string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.ini");
+            Dictionary<string, string> d = Proto.ParseIniStrings(p);
+            string s;
+            if (d.TryGetValue("ToggleMapKey", out s))
+            {
+                Keys k;
+                if (Enum.TryParse<Keys>(s, true, out k)) return k;
+            }
+        }
+        catch (Exception) { }
+        return Keys.F9;
+    }
 
     private static string Heading8(float deg)
     {

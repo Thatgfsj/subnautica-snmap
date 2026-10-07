@@ -40,6 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
+        public const string Version = "2.2";   // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X")
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -69,7 +70,7 @@ namespace SNMap
                 sb.AppendLine("FontSize=" + FontSize);
                 sb.AppendLine("WorldRange=" + WorldRange.ToString("0", CultureInfo.InvariantCulture));
                 sb.AppendLine("MinimapPixels=" + MinimapPixels);
-                sb.AppendLine("# 小地图各档显示范围(米), 逗号分隔, F7 循环: 200->300->500->1000->200");
+                sb.AppendLine("# 小地图各档显示范围(米), 逗号分隔, F7 循环: 200->300->500->1000->关->200");
                 sb.AppendLine("MinimapSpans=200,300,500,1000");
                 sb.AppendLine("# 攻击性生物白名单(大地图红三角只显示这些), TechType 名逗号分隔, 删掉本行=全部显示");
                 sb.AppendLine("# 大型: BoneShark Sandshark Stalker Crabsnake CrabSquid Warper Shocker SpineEel");
@@ -171,7 +172,7 @@ namespace SNMap
         private GUIStyle hudStyle;
         private GUIStyle smallStyle;
         private GUIStyle miniSignalStyle;
-        private int minimapIdx = 0;   // MinimapSpans 下标, F7 纯循环(无关闭档)
+        private int minimapIdx = 1;   // 0=关闭档, 1..N 对应 MinimapSpans; F7: 200->300->500->1000->关->200
         private List<MapLayer> layers = new List<MapLayer>();
         private FieldInfo pingsDictField;
         private FieldInfo pingColorsField;
@@ -212,7 +213,7 @@ namespace SNMap
             stateBuf = new byte[8192];
             if (layers.Count > 0) GetTex(layers[0]);
 
-            Cfg.Log("SNMap 2.0 awake | layers=" + layers.Count +
+            Cfg.Log("SNMap " + Cfg.Version + " awake | layers=" + layers.Count +
                     " cjk=" + uiFontCjk + " pings=" + (pingsDictField != null) +
                     " bigKey=" + Cfg.ToggleMapKey + " miniKey=" + Cfg.ToggleHudKey);
         }
@@ -230,7 +231,7 @@ namespace SNMap
             }
             if (Enum.TryParse(Cfg.ToggleHudKey, true, out kc) && Input.GetKeyDown(kc))
             {
-                minimapIdx = (minimapIdx + 1) % Cfg.MinimapSpans.Length;
+                minimapIdx = (minimapIdx + 1) % (Cfg.MinimapSpans.Length + 1);   // +1 = 末尾关闭档
             }
 
             frame++;
@@ -346,6 +347,12 @@ namespace SNMap
                 PutInt(buf, Proto.OffVersion, Proto.Version);
                 PutLong(buf, Proto.OffTick, Environment.TickCount);
                 buf[Proto.OffShowWindow] = settingsShowWindow;
+
+                // 模块版本串写进状态文件(窗口显示"模块vX.X"), 上限 32 字节
+                byte[] mv = Encoding.UTF8.GetBytes(Cfg.Version);
+                if (mv.Length > 32) Array.Resize(ref mv, 32);
+                PutInt(buf, Proto.OffModVerLen, mv.Length);
+                PutBytes(buf, Proto.OffModVer, mv);
 
                 Player pl = Player.main;
                 int valid = 0;
@@ -539,11 +546,17 @@ namespace SNMap
             }
             LabelShadowed(new Rect(16, 12, 1200, 60), line, hudStyle);
 
-            if (Cfg.MinimapSpans.Length > 0)
+            if (minimapIdx > 0 && Cfg.MinimapSpans.Length > 0)
             {
                 MapLayer ml = MinimapLayer();
                 if (ml != null && GetTex(ml) != null)
                     DrawMinimap(pl, ml);
+            }
+            else
+            {
+                // 关闭档: 小地图整体不画(信号点/标签也一起藏), 只留一行提示, 免得以为工具坏了
+                LabelShadowed(new Rect(16, 48, 400, 22),
+                    uiFontCjk ? "小地图: 关  [F7 开启]" : "minimap: off  [F7]", smallStyle);
             }
         }
 
@@ -671,7 +684,7 @@ namespace SNMap
         {
             float D = Mathf.Min(Cfg.MinimapPixels, Screen.height - 80f);
             Rect sq = new Rect(16f, 48f, D, D);
-            float spanWorld = Cfg.MinimapSpans[Mathf.Clamp(minimapIdx, 0, Cfg.MinimapSpans.Length - 1)];
+            float spanWorld = Cfg.MinimapSpans[Mathf.Clamp(minimapIdx - 1, 0, Cfg.MinimapSpans.Length - 1)];
             float su = spanWorld / (L.MaxX - L.MinX);
             float sv = spanWorld / (L.MaxZ - L.MinZ);
 
