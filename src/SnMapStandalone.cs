@@ -46,8 +46,8 @@ namespace SNMap
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
         public static float WorldRange = 2000f;
-        public static int MinimapPixels = 220;
-        public static float[] MinimapSpans = new float[] { 200f, 300f, 500f };
+        public static int MinimapPixels = 360;
+        public static float[] MinimapSpans = new float[] { 200f, 300f, 500f, 1000f };
         public static string BaseDir = ".";
 
         public static void Init()
@@ -71,7 +71,7 @@ namespace SNMap
                 sb.AppendLine("WorldRange=" + WorldRange.ToString("0", CultureInfo.InvariantCulture));
                 sb.AppendLine("MinimapPixels=" + MinimapPixels);
                 sb.AppendLine("# 小地图各档显示范围(米), 逗号分隔, F7 循环: 关->第1档->第2档->...");
-                sb.AppendLine("MinimapSpans=200,300,500");
+                sb.AppendLine("MinimapSpans=200,300,500,1000");
                 try { File.WriteAllText(path, sb.ToString()); } catch (Exception) { }
                 return;
             }
@@ -160,6 +160,10 @@ namespace SNMap
         public const int OffBeacons = 128;    // 32 * 128B: x(0f) z(4f) color(8i) visible(12i) labelLen(16i) label(20+64B)
         public const int OffWindowLayer = 4224; // int (窗口写: 当前图层索引)
         public const int OffWorldRange = 4228;  // float (模块写: 默认标定半径)
+        public const int OffMinimapPixels = 4232; // int (窗口写: 小地图像素大小)
+        public const int OffShowCreatures = 4236; // byte (窗口写: 是否显示攻击性生物)
+        public const int OffCreatureCount = 4240; // int (模块写)
+        public const int OffCreatures = 4248;     // 24 * 80B: x(0f) z(4f) labelLen(8i) label(12+68B)
     }
 
     public class SnMapBehaviour : MonoBehaviour
@@ -171,6 +175,7 @@ namespace SNMap
         private bool uiFontCjk;
         private GUIStyle hudStyle;
         private GUIStyle smallStyle;
+        private GUIStyle miniSignalStyle;
         private int minimapIdx = 1;
         private List<MapLayer> layers = new List<MapLayer>();
         private FieldInfo pingsDictField;
@@ -246,6 +251,9 @@ namespace SNMap
                 acc.Write(SharedState.OffMagic, (int)0x534E4D50);
                 acc.Write(SharedState.OffVersion, (int)1);
                 acc.Write(SharedState.OffWorldRange, Cfg.WorldRange);
+                acc.Write(SharedState.OffMinimapPixels, Cfg.MinimapPixels);
+                acc.Write(SharedState.OffShowCreatures, (byte)1);
+                acc.Write(SharedState.OffCreatureCount, 0);
                 // 不清零 showWindow; 若地图窗口已在运行, 保持其可见
                 try
                 {
@@ -287,8 +295,29 @@ namespace SNMap
             }
 
             frame++;
+            ReadWindowSettings();
             WriteState();
         }
+
+        // 窗口可以实时改小地图大小/生物开关
+        private void ReadWindowSettings()
+        {
+            if (acc == null || frame % 30 != 0) return;
+            try
+            {
+                int px = acc.ReadInt32(SharedState.OffMinimapPixels);
+                if (px >= 120 && px <= 800 && px != Cfg.MinimapPixels)
+                {
+                    Cfg.MinimapPixels = px;
+                    BuildRingTexture(px);
+                    Cfg.Log("minimap size set to " + px + "px by window");
+                }
+                showCreatures = acc.ReadByte(SharedState.OffShowCreatures) != 0;
+            }
+            catch (Exception) { }
+        }
+
+        private bool showCreatures = true;
 
         private void WriteState()
         {
@@ -336,7 +365,8 @@ namespace SNMap
             List<PingInstance> sorted = new List<PingInstance>();
             foreach (PingInstance pi in list)
             {
-                if (pi != null && pi.visible) sorted.Add(pi);
+                // PingType.Signal = 扫描室扫描目标: 只显示在小地图, 不发给大地图窗口
+                if (pi != null && pi.visible && pi.pingType != PingType.Signal) sorted.Add(pi);
             }
             sorted.Sort(delegate(PingInstance a, PingInstance b)
             {
@@ -361,6 +391,63 @@ namespace SNMap
                 acc.Write(off + 16, b.Length);
                 if (b.Length > 0) acc.WriteArray(off + 20, b, 0, b.Length);
             }
+
+            // 攻击性生物(每 60 帧=1秒 扫一次, 取最近 24 只)
+            if (!showCreatures)
+            {
+                acc.Write(SharedState.OffCreatureCount, 0);
+                return;
+            }
+            if (frame % 60 != 0 && lastCreatureFrame != 0 && frame - lastCreatureFrame < 60) return;
+            lastCreatureFrame = frame;
+            try
+            {
+                Creature[] all = UnityEngine.Object.FindObjectsOfType<Creature>();
+                List<Creature> aggr = new List<Creature>();
+                foreach (Creature c in all)
+                {
+                    if (c == null || !c.gameObject.activeInHierarchy) continue;
+                    if (c.GetComponent<AggressiveWhenSeeTarget>() == null && c.GetComponent<AttackLastTarget>() == null) continue;
+                    if ((c.transform.position - pp).sqrMagnitude > 360000f) continue; // 600m
+                    aggr.Add(c);
+                }
+                aggr.Sort(delegate(Creature a, Creature b)
+                {
+                    return (a.transform.position - pp).sqrMagnitude.CompareTo((b.transform.position - pp).sqrMagnitude);
+                });
+                int cn = Mathf.Min(aggr.Count, 24);
+                acc.Write(SharedState.OffCreatureCount, cn);
+                for (int i = 0; i < cn; i++)
+                {
+                    Vector3 q = aggr[i].transform.position;
+                    int off = SharedState.OffCreatures + i * 80;
+                    acc.Write(off, q.x);
+                    acc.Write(off + 4, q.z);
+                    string nm = CreatureName(aggr[i]);
+                    byte[] nb = string.IsNullOrEmpty(nm) ? new byte[0] : Encoding.UTF8.GetBytes(nm);
+                    if (nb.Length > 66) Array.Resize(ref nb, 66);
+                    acc.Write(off + 8, nb.Length);
+                    if (nb.Length > 0) acc.WriteArray(off + 12, nb, 0, nb.Length);
+                }
+            }
+            catch (Exception ex)
+            {
+                acc.Write(SharedState.OffCreatureCount, 0);
+                if (frame % 1800 == 0) Cfg.Log("creature scan failed: " + ex.Message);
+            }
+        }
+
+        private int lastCreatureFrame;
+
+        private static string CreatureName(Creature c)
+        {
+            try
+            {
+                TechTag tt = c.GetComponent<TechTag>();
+                if (tt != null) return Language.main.Get(tt.type.AsString());
+            }
+            catch (Exception) { }
+            return c.gameObject.name.Replace("(Clone)", "");
         }
 
         // ---------------------------------------------------------------- OnGUI
@@ -606,10 +693,21 @@ namespace SNMap
                     float sx = sq.x + (0.5f + dx / spanWorld) * D;
                     float sy = sq.y + (0.5f + dz / spanWorld) * D;
                     if (Vector2.Distance(new Vector2(sx, sy), sq.center) > D * 0.5f - 13f) continue;
-                    int ci = pi.colorIndex >= 0 ? pi.colorIndex : 0;
-                    GUI.color = colors[ci % colors.Length];
+                    bool isScan = pi.pingType == PingType.Signal;   // 扫描室扫描目标
+                    if (isScan) GUI.color = new Color(1f, 0.62f, 0.1f);
+                    else
+                    {
+                        int ci = pi.colorIndex >= 0 ? pi.colorIndex : 0;
+                        GUI.color = colors[ci % colors.Length];
+                    }
                     GUI.DrawTexture(new Rect(sx - 5f, sy - 5f, 10f, 10f), dotTex);
                     GUI.color = Color.white;
+                    if (isScan)
+                    {
+                        string lbl = pi.GetLabel();
+                        if (!string.IsNullOrEmpty(lbl))
+                            LabelShadowed(new Rect(sx + 7f, sy - 7f, 200f, 18f), lbl, miniSignalStyle);
+                    }
                 }
             }
 
@@ -759,20 +857,36 @@ namespace SNMap
             }
         }
 
+        // 与大地图窗口相同的风筝形箭头(顶点朝上), 红底黑边
         private void BuildArrowTexture()
         {
-            int w = 32, h = 32;
+            int w = 26, h = 26;
+            float[] xs = new float[] { 13f, 22f, 13f, 4f };
+            float[] ys = new float[] { 0f, 23f, 16f, 23f };
             bool[] solid = new bool[w * h];
             for (int y = 0; y < h; y++)
             {
-                int half;
-                if (y <= 19) half = 1 + (y * 14) / 19;
-                else if (y <= 30) half = 3;
-                else half = 2;
+                float scanY = y + 0.5f;
+                float minX = 1e9f, maxX = -1e9f;
+                bool any = false;
+                for (int i = 0; i < 4; i++)
+                {
+                    int j = (i + 1) % 4;
+                    float y0 = ys[i], y1 = ys[j];
+                    if ((y0 <= scanY && y1 > scanY) || (y1 <= scanY && y0 > scanY))
+                    {
+                        float t = (scanY - y0) / (y1 - y0);
+                        float x = xs[i] + (xs[j] - xs[i]) * t;
+                        any = true;
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                    }
+                }
+                if (!any) continue;
                 for (int x = 0; x < w; x++)
                 {
-                    int dx = x - 16;
-                    if (dx >= -half && dx <= half) solid[y * w + x] = true;
+                    float xm = x + 0.5f;
+                    if (xm >= minX - 0.5f && xm <= maxX + 0.5f) solid[y * w + x] = true;
                 }
             }
 
@@ -786,10 +900,10 @@ namespace SNMap
                     int idx = y * w + x;
                     if (solid[idx]) { px[idx] = main; continue; }
                     bool near = false;
-                    for (int dy = -1; dy <= 1 && !near; dy++)
-                        for (int dx = -1; dx <= 1 && !near; dx++)
+                    for (int dy2 = -1; dy2 <= 1 && !near; dy2++)
+                        for (int dx2 = -1; dx2 <= 1 && !near; dx2++)
                         {
-                            int nx = x + dx, ny = y + dy;
+                            int nx = x + dx2, ny = y + dy2;
                             if (nx >= 0 && ny >= 0 && nx < w && ny < h && solid[ny * w + nx]) near = true;
                         }
                     if (near) px[idx] = edge;
@@ -841,6 +955,9 @@ namespace SNMap
 
             smallStyle = new GUIStyle(hudStyle);
             smallStyle.fontSize = Mathf.Max(12, Cfg.FontSize - 6);
+
+            miniSignalStyle = new GUIStyle(smallStyle);
+            miniSignalStyle.fontSize = Mathf.Max(11, Cfg.FontSize - 8);
         }
     }
 }
