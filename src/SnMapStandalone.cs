@@ -434,8 +434,8 @@ namespace SNMap
                     Creature c = trackedCreatures[i];
                     if (c == null) continue;
                     Vector3 cq = c.transform.position;
-                    PutFloat(creatureRec, i * 80, cq.x);
-                    PutFloat(creatureRec, i * 80 + 4, cq.z);
+                    PutFloat(creatureRec, i * 80, Q(cq.x));
+                    PutFloat(creatureRec, i * 80 + 4, Q(cq.z));
                 }
                 Buffer.BlockCopy(creatureRec, 0, buf, Proto.OffCreatures, creatureRec.Length);   // 每帧原样写回
 
@@ -541,8 +541,8 @@ namespace SNMap
                 Vector3 q = pi.GetPosition();
                 bool isScan = pi.pingType == PingType.Signal;
                 int off = Proto.OffBeacons + i * 128;
-                PutFloat(buf, off, q.x);
-                PutFloat(buf, off + 4, q.z);
+                PutFloat(buf, off, Q(q.x));
+                PutFloat(buf, off + 4, Q(q.z));
                 PutInt(buf, off + 8, pi.colorIndex >= 0 ? pi.colorIndex : 0);
                 PutInt(buf, off + 12, 1);
                 string lbl = pi.GetLabel();
@@ -566,8 +566,8 @@ namespace SNMap
             {
                 int off = Proto.OffBeacons + total * 128;
                 Vector3 q = scanNodePos[i];
-                PutFloat(buf, off, q.x);
-                PutFloat(buf, off + 4, q.z);
+                PutFloat(buf, off, Q(q.x));
+                PutFloat(buf, off + 4, Q(q.z));
                 PutInt(buf, off + 8, 0);
                 PutInt(buf, off + 12, 1);
                 string nm = scanNodeName[i];
@@ -629,8 +629,8 @@ namespace SNMap
                 {
                     Vector3 q = aggr[i].transform.position;
                     int off = i * 80;
-                    PutFloat(creatureRec, off, q.x);
-                    PutFloat(creatureRec, off + 4, q.z);
+                    PutFloat(creatureRec, off, Q(q.x));
+                    PutFloat(creatureRec, off + 4, Q(q.z));
                     string nm = CreatureName(aggr[i]);
                     byte[] nb = string.IsNullOrEmpty(nm) ? new byte[0] : Encoding.UTF8.GetBytes(nm);
                     if (nb.Length > 32) Array.Resize(ref nb, 32);
@@ -707,25 +707,6 @@ namespace SNMap
                     if (frame % 600 == 0) Cfg.Log("scanner: 场景里没找到扫描室");
                     return;
                 }
-                // 取离玩家最近的那个扫描室(原来直接用 rooms[0]: 有多个房间时会拿错对象)
-                MapRoomFunctionality room = null;
-                float bestD = float.MaxValue;
-                for (int i = 0; i < rooms.Length; i++)
-                {
-                    if (rooms[i] == null) continue;
-                    float d = (rooms[i].transform.position - pp).sqrMagnitude;
-                    if (d < bestD) { bestD = d; room = rooms[i]; }
-                }
-                if (room == null) return;
-                float range = room.GetScanRange();
-                Vector3 rp = room.transform.position;
-
-                List<TechType> types = new List<TechType>();
-                ResourceTrackerDatabase.GetTechTypesInRange(rp, range, types);
-                if (frame % 300 == 0)
-                    Cfg.Log("scanner: rooms=" + rooms.Length + " 最近距离=" + Mathf.RoundToInt(Mathf.Sqrt(bestD)) +
-                            "m range=" + Mathf.RoundToInt(range) + " types=" + types.Count + " nodes=" + scanNodePos.Count);
-                if (types.Count == 0) return;
 
                 if (!scannerApiReady)
                 {
@@ -751,43 +732,74 @@ namespace SNMap
                     }
                     Cfg.Log("scanner api: GetNodes(TechType)=" + (getNodesM != null) + " resourceInfo=" + (riType != null));
                 }
-                if (getNodesM == null || riType == null || scanNodePos.Count >= 48) return;
+                if (getNodesM == null || riType == null) return;
 
-                // 逐类型取"全世界该类型的节点", 距离过滤自己做(房间范围 + 玩家 800m 双重限制)。
-                // 每个类型限额, 否则第一个类型(比如石灰岩)会把 48 个位子全占掉, 你选的那个物品一个都轮不上。
-                float lim = range + 60f;
-                int perType = Mathf.Clamp(48 / Mathf.Max(1, types.Count), 4, 24);
-                for (int t = 0; t < types.Count && scanNodePos.Count < 48; t++)
+                // 每个扫描室只显示它"当前正在扫描的那一个物品"(用户要求):
+                // 一个房间同一时间只扫一种东西, 多个房间各扫各的 -> 逐个房间取它 GetActiveTechType() 对应的节点。
+                // 之前是"把房间里所有可扫描类型全铺出来", 所以小地图上会有一大堆不相干的点。
+                int activeRooms = 0;
+                int perRoom = 16;
+                for (int r = 0; r < rooms.Length && scanNodePos.Count < 48; r++)
                 {
+                    MapRoomFunctionality room = rooms[r];
+                    if (room == null) continue;
+                    Vector3 rp;
+                    TechType act;
+                    float range;
+                    try
+                    {
+                        rp = room.transform.position;
+                        act = room.GetActiveTechType();
+                        range = room.GetScanRange();
+                    }
+                    catch (Exception) { continue; }
+                    if (act == TechType.None) continue;                       // 这个房间空闲/没在扫描
+                    if ((rp - pp).sqrMagnitude > 640000f) continue;            // 房间离玩家 >800m 不管
+
+                    activeRooms++;
+                    string key = act.ToString();
+                    string cn = null;
+                    try { cn = Language.main.Get(act.AsString()); } catch (Exception) { }
+                    if (string.IsNullOrEmpty(cn)) cn = key;
+
                     System.Collections.IEnumerable all = null;
-                    try { all = getNodesM.Invoke(null, new object[] { types[t] }) as System.Collections.IEnumerable; }
+                    try { all = getNodesM.Invoke(null, new object[] { act }) as System.Collections.IEnumerable; }
                     catch (Exception ex) { if (scanErrLogged < 3) { scanErrLogged++; Cfg.Log("GetNodes invoke fail: " + ex.Message); } }
                     if (all == null) continue;
-                    int takenThisType = 0;
+
+                    float lim = range + 60f;
+                    int taken = 0;
                     foreach (object info in all)
                     {
-                        if (info == null || scanNodePos.Count >= 48 || takenThisType >= perType) break;
+                        if (info == null || taken >= perRoom || scanNodePos.Count >= 48) break;
                         scanRawTotal++;
-                        TechType tt = (TechType)riTechF.GetValue(info);
+                        TechType nt = (TechType)riTechF.GetValue(info);
+                        if (nt != act) continue;                               // 保险: 只要这个房间正在扫的类型
                         Vector3 pos = (Vector3)riPosF.GetValue(info);
-                        if ((pos - rp).sqrMagnitude > lim * lim) continue;         // 离扫描室太远
-                        if ((pos - pp).sqrMagnitude > 640000f) continue;           // 离玩家 >800m 不画
+                        if ((pos - rp).sqrMagnitude > lim * lim) continue;      // 超出该房间的扫描范围
+                        if ((pos - pp).sqrMagnitude > 640000f) continue;        // 离玩家太远
                         scanNodePos.Add(pos);
-                        scanNodeKey.Add(tt.ToString());
-                        string cn = null;
-                        try { cn = Language.main.Get(tt.AsString()); } catch (Exception) { }
-                        scanNodeName.Add(string.IsNullOrEmpty(cn) ? tt.ToString() : cn);
-                        takenThisType++;
+                        scanNodeKey.Add(key);
+                        scanNodeName.Add(cn);
+                        taken++;
                     }
                 }
                 if (frame % 300 == 0)
-                    Cfg.Log("scanner: 数据库原始节点=" + scanRawTotal + " 采用=" + scanNodePos.Count +
-                            " 第一个=" + (scanNodeKey.Count > 0 ? scanNodeKey[0] : "-"));
+                    Cfg.Log("scanner: rooms=" + rooms.Length + " 在扫描=" + activeRooms +
+                            " 原始节点=" + scanRawTotal + " 采用=" + scanNodePos.Count +
+                            " 物品=" + (scanNodeKey.Count > 0 ? scanNodeKey[0] : "-"));
             }
             catch (Exception ex)
             {
                 if (scanErrLogged < 3) { scanErrLogged++; Cfg.Log("scanner nodes failed: " + ex.Message); }
             }
+        }
+
+        // 坐标降精度到 1 位小数(用户要求): 标记点不需要亚分米精度, 量化后写进状态文件的数值稳定,
+        // 大地图那头的"按坐标签名判断要不要重绘"也不会因为普朗克级抖动而反复重画。
+        private static float Q(float v)
+        {
+            return Mathf.Round(v * 10f) / 10f;
         }
 
         // 建立"本地化物品名 -> TechType 名"反查表(扫描室的 ping 只有中文名, 没有 TechType)。
@@ -1240,7 +1252,20 @@ namespace SNMap
             float u0 = Mathf.Clamp(uc - su * 0.5f, 0f, 1f - su);
             float v0 = Mathf.Clamp(vc - sv * 0.5f, 0f, 1f - sv);   // 窗口南边界(v)
             float winX0 = L.MinX + u0 * (L.MaxX - L.MinX);         // 窗口西边界(世界 x)
+
+            // 像素吸附: Unity 画贴图最终会吸附到整像素, 而窗口原点原来每帧跟着玩家的轻微晃动(在水里被水流推)
+            // 连续微调 -> 标记就在相邻两个像素之间来回跳 = "一直抖动"。把原点吸附到"整屏幕像素"上,
+            // 地图与所有标记用同一个原点, 于是水里晃动时整幅图纹丝不动地吸附在像素格上。
+            float mpp = spanWorld / D;                              // 每个屏幕像素代表多少米
             float winZ0 = L.MinZ + v0 * (L.MaxZ - L.MinZ);         // 窗口南边界(世界 z)
+            if (mpp > 0f)
+            {
+                winX0 = Mathf.Floor(winX0 / mpp) * mpp;
+                winZ0 = Mathf.Floor(winZ0 / mpp) * mpp;
+                // 原点变了, 贴图 UV 必须跟着重算, 否则底图和标记会错开
+                u0 = Mathf.Clamp((winX0 - L.MinX) / (L.MaxX - L.MinX), 0f, 1f - su);
+                v0 = Mathf.Clamp((winZ0 - L.MinZ) / (L.MaxZ - L.MinZ), 0f, 1f - sv);
+            }
 
             // 圆形小地图: 逐列切片绘制, 圆外完全透明(露出游戏画面)
             float cx = D * 0.5f, cy = D * 0.5f, R = D * 0.5f;
@@ -1275,8 +1300,8 @@ namespace SNMap
                     Vector3 q = pi.GetPosition();
                     // 与地图底图用同一套世界→屏幕换算(窗口可能因贴边被 clamp, 所以按窗口原点算, 不按玩家算)
                     if (q.x < winX0 || q.x > winX0 + spanWorld || q.z < winZ0 || q.z > winZ0 + spanWorld) continue;
-                    float sx = sq.x + (q.x - winX0) / spanWorld * D;
-                    float sy = sq.y + (1f - (q.z - winZ0) / spanWorld) * D;
+                    float sx = Mathf.Round(sq.x + (q.x - winX0) / spanWorld * D);
+                    float sy = Mathf.Round(sq.y + (1f - (q.z - winZ0) / spanWorld) * D);
                     if (Vector2.Distance(new Vector2(sx, sy), sq.center) > D * 0.5f - 13f) continue;
                     bool isScan = pi.pingType == PingType.Signal;   // 扫描室扫描目标
                     if (isScan && !showScanSignals) continue;       // 设置窗口里可关掉
@@ -1313,8 +1338,8 @@ namespace SNMap
             {
                 Vector3 q = scanNodePos[i];
                 if (q.x < winX0 || q.x > winX0 + spanWorld || q.z < winZ0 || q.z > winZ0 + spanWorld) continue;
-                float nx = sq.x + (q.x - winX0) / spanWorld * D;
-                float ny = sq.y + (1f - (q.z - winZ0) / spanWorld) * D;
+                float nx = Mathf.Round(sq.x + (q.x - winX0) / spanWorld * D);
+                float ny = Mathf.Round(sq.y + (1f - (q.z - winZ0) / spanWorld) * D);
                 if (Vector2.Distance(new Vector2(nx, ny), sq.center) > D * 0.5f - 12f) continue;
                 Texture2D nico = GetIconTex(scanNodeKey[i]);
                 if (nico != null)
@@ -1337,8 +1362,8 @@ namespace SNMap
                 if (c == null) continue;
                 Vector3 q = c.transform.position;
                 if (q.x < winX0 || q.x > winX0 + spanWorld || q.z < winZ0 || q.z > winZ0 + spanWorld) continue;
-                float mx = sq.x + (q.x - winX0) / spanWorld * D;
-                float my = sq.y + (1f - (q.z - winZ0) / spanWorld) * D;
+                float mx = Mathf.Round(sq.x + (q.x - winX0) / spanWorld * D);
+                float my = Mathf.Round(sq.y + (1f - (q.z - winZ0) / spanWorld) * D);
                 if (Vector2.Distance(new Vector2(mx, my), sq.center) > D * 0.5f - 12f) continue;
                 Texture2D cico = GetIconTex(i < trackedKeys.Count ? trackedKeys[i] : null);
                 if (cico != null)
@@ -1354,8 +1379,8 @@ namespace SNMap
 
             // 玩家箭头: 位置按同一套换算(贴图层边缘被 clamp 时会离开圆心, 这样才对得上底图);
             // 方向不用 GUI 旋转矩阵(受 GUI 矩阵/缩放影响不可控), 自己在屏幕空间算三角形逐行填充
-            float psx = sq.x + (p.x - winX0) / spanWorld * D;
-            float psy = sq.y + (1f - (p.z - winZ0) / spanWorld) * D;
+            float psx = Mathf.Round(sq.x + (p.x - winX0) / spanWorld * D);
+            float psy = Mathf.Round(sq.y + (1f - (p.z - winZ0) / spanWorld) * D);
             DrawPlayerArrow(psx, psy, HeadingAngle());
 
             LabelShadowed(new Rect(sq.center.x - 20f, sq.y + 4f, 40f, 20f), "N", smallStyle);
