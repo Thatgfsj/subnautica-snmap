@@ -1029,7 +1029,7 @@ public class MapForm : Form
                     // (原来在底下垫了一层半透明黑方块想"在浅色地图上也看得清", 结果图标有透明边时
                     //  黑方块就从边上透出来 -> 看起来像黑边/黑框, 已去掉)
                     Rectangle ir = new Rectangle((int)(sp.X - 10f), (int)(sp.Y - 10f), 20, 20);
-                    g.DrawImage(bic, ir);
+                    DrawIconOutlined(g, bic, ir);
                 }
                 else
                 {
@@ -1067,7 +1067,7 @@ public class MapForm : Form
                     {
                         // 生物头像(内置 icons/<TechType>.png) —— 直接画, 不垫黑方块(否则透明边会变成黑边)
                         Rectangle ir = new Rectangle((int)(cp.X - 12f), (int)(cp.Y - 12f), 24, 24);
-                        g.DrawImage(cic, ir);
+                        DrawIconOutlined(g, cic, ir);
                     }
                     else
                     {
@@ -1155,6 +1155,58 @@ public class MapForm : Form
             for (int dy = -2; dy <= 2; dy += 2)
                 if (dx != 0 || dy != 0) g.DrawString("!", alertFont, Brushes.Black, x + dx, y + dy);
         g.DrawString("!", alertFont, alertBrush, x, y);
+    }
+
+    // 图标 + 1px 深色轮廓: 先画 8 个方向各偏移 1 像素的黑色剪影(保留 alpha, 所以不是方块),
+    // 再把图标本身画上去。这样浅色地图区域也看得清, 又不会像之前的黑方块那样在透明边露出黑框。
+    private readonly Dictionary<Image, Image> outlineCache = new Dictionary<Image, Image>();
+
+    private Image GetOutline(Image src)
+    {
+        if (src == null) return null;
+        Image o;
+        if (outlineCache.TryGetValue(src, out o)) return o;
+        if (outlineCache.Count >= 256) return null;
+        try
+        {
+            Bitmap bmp = new Bitmap(src.Width, src.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.Clear(Color.Transparent);
+                ColorMatrix cm = new ColorMatrix(new float[][]
+                {
+                    new float[] { 0, 0, 0, 0, 0 },     // R' = 0
+                    new float[] { 0, 0, 0, 0, 0 },     // G' = 0
+                    new float[] { 0, 0, 0, 0, 0 },     // B' = 0
+                    new float[] { 0, 0, 0, 1, 0 },     // A' = A(保留原图透明度)
+                    new float[] { 0, 0, 0, 0, 1 }
+                });
+                System.Drawing.Imaging.ImageAttributes ia = new System.Drawing.Imaging.ImageAttributes();
+                ia.SetColorMatrix(cm);
+                g.DrawImage(src, new Rectangle(0, 0, src.Width, src.Height),
+                            0, 0, src.Width, src.Height, GraphicsUnit.Pixel, ia);
+            }
+            o = bmp;
+        }
+        catch (Exception) { o = null; }
+        outlineCache[src] = o;
+        return o;
+    }
+
+    private void DrawIconOutlined(Graphics g, Image img, Rectangle rect)
+    {
+        if (img == null) return;
+        Image ol = GetOutline(img);
+        if (ol != null)
+        {
+            for (int dx = -1; dx <= 1; dx++)
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    if (dx == 0 && dy == 0) continue;
+                    g.DrawImage(ol, new Rectangle(rect.X + dx, rect.Y + dy, rect.Width, rect.Height));
+                }
+        }
+        g.DrawImage(img, rect);
     }
 
     private SolidBrush PingBrush(int idx)
