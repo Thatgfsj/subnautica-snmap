@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.7p";  // 模块版本: 日志 + 状态文件; p=生物扫描全流程诊断 + TechTag 子物体兜底
+        public const string Version = "2.7q";  // 模块版本: 日志 + 状态文件; q=利维坦没有 TechTag -> 用 GameObject 名字反查物种
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -226,6 +226,7 @@ namespace SNMap
         private int perfFrames;
         // v2.7n 生物显示相关
         private readonly HashSet<string> skipLogged = new HashSet<string>();   // 被筛掉的物种只记一次, 不刷屏
+        private readonly List<string> aggrSpecies = new List<string>();        // 与 aggrCache 对齐的物种名
         private Type leviathanType;
         private bool leviathanTried;
         private int iconLoaded;                                                // 只数"真正载入成功"的图标
@@ -326,6 +327,7 @@ namespace SNMap
                 {
                     // 设置窗口里按物种勾选的结果: 逗号分隔的 TechType 名; "*"=全部显示
                     string t = s.Trim();
+                    creatureShowSet = null;      // v2.7q: 清单变了, 大小写不敏感集合要重建
                     if (t == "*") { creatureShowAll = true; creatureShow = null; }
                     else
                     {
@@ -676,6 +678,7 @@ namespace SNMap
                 Creature[] all = UnityEngine.Object.FindObjectsOfType<Creature>();
                 List<Creature> aggr = aggrCache;      // 复用, 不再每次扫描 new 一个 List
                 aggr.Clear();
+                aggrSpecies.Clear();                   // 与 aggr 一一对应的物种名(给图标键/标签用)
                 // v2.7p 诊断: 全流程计数 + 记录最近的一只(用来确认"利维坦到底走到哪一步被丢了")
                 int nActive = 0, nTag = 0, nAI = 0, nWhite = 0, nDist = 0;
                 float bestDsq = float.MaxValue;
@@ -686,35 +689,34 @@ namespace SNMap
                     if (c == null || !c.gameObject.activeInHierarchy) continue;
                     nActive++;
                     float dsq0 = (c.transform.position - pp).sqrMagnitude;
-                    TechTag tg = c.GetComponent<TechTag>();
-                    // v2.7p: TechTag 也可能挂在子物体上 —— 查不到时原来会静默丢弃整只生物(一句话都不记)
-                    if (tg == null)
-                    {
-                        try { tg = c.GetComponentInChildren<TechTag>(); } catch (Exception) { }
-                    }
+                    TechTag tg = null;
+                    try { tg = c.GetComponent<TechTag>(); } catch (Exception) { }
+                    // v2.7p/q: TechTag 也可能挂在(未激活的)子物体上; 实测利维坦根本没有 TechTag,
+                    // 所以下面用 SpeciesOf 再兜两层(GameObject 名字反查 TechType 枚举)
+                    if (tg == null) { try { tg = c.GetComponentInChildren<TechTag>(true); } catch (Exception) { } }
+                    string species = SpeciesOf(c, tg);
                     if (tg != null) nTag++;
                     if (dsq0 < bestDsq)
                     {
                         bestDsq = dsq0;
-                        bestDesc = (tg != null ? tg.type.ToString() : "?tag") + "/" + c.gameObject.name +
-                                   "@" + Mathf.RoundToInt(Mathf.Sqrt(dsq0)) + "m rAI=" +
+                        bestDesc = (species != null ? species : "?") + (tg == null ? "(无Tag)" : "") + "/" +
+                                   c.gameObject.name + "@" + Mathf.RoundToInt(Mathf.Sqrt(dsq0)) + "m rAI=" +
                                    (c.GetComponent<AggressiveWhenSeeTarget>() != null || c.GetComponent<AttackLastTarget>() != null ? 1 : 0);
                     }
                     // 根对象上的攻击组件(便宜)
                     bool rootAI = c.GetComponent<AggressiveWhenSeeTarget>() != null || c.GetComponent<AttackLastTarget>() != null;
                     // 物种清单: 不管当前勾没勾显示, 见过就记下来(设置窗口要能列出全部敌对生物)
-                    if (rootAI && tg != null)
+                    if (rootAI && species != null)
                     {
-                        string sp = tg.type.ToString();
-                        if (sp.Length > 0 && seenSpecies.Count < Proto.MaxSpecies && !seenSpecies.Contains(sp))
-                            seenSpecies.Add(sp);
+                        if (species.Length > 0 && seenSpecies.Count < Proto.MaxSpecies && !seenSpecies.Contains(species))
+                            seenSpecies.Add(species);
                     }
                     // v2.7o: 先做便宜的白名单判断, 再做贵的"子物体找 AI"。
                     // GetComponentInChildren 会走整棵子物体树, 而场景里几百条鱼全部都不通过根检查 ->
                     // 每条鱼两次子物体搜索 = 5ms 级别的周期性卡顿(自检日志里 beacon=4.5~5.8ms 就是它)。
-                    if (!CreatureVisible(tg))
+                    if (!CreatureVisible(species))
                     {
-                        LogSkipOnce(tg != null ? tg.type.ToString() : c.gameObject.name, "不在显示清单(设置里没勾/无Tag)");
+                        LogSkipOnce(species != null ? species : c.gameObject.name, "不在显示清单(设置里没勾)");
                         continue;
                     }
                     nWhite++;
@@ -723,7 +725,7 @@ namespace SNMap
                         c.GetComponentInChildren<AggressiveWhenSeeTarget>() == null &&
                         c.GetComponentInChildren<AttackLastTarget>() == null)
                     {
-                        LogSkipOnce(tg.type.ToString(), "没有攻击组件");
+                        LogSkipOnce(species, "没有攻击组件");
                         continue;
                     }
                     nAI++;
@@ -731,11 +733,12 @@ namespace SNMap
                     // 大地图本来就能缩放平移看远处, 卡在 600m 会让"利维坦不显示"。
                     if (dsq0 > 2250000f)      // 1500m
                     {
-                        LogSkipOnce(tg.type.ToString(), "太远(>1500m)");
+                        LogSkipOnce(species, "太远(>1500m)");
                         continue;
                     }
                     nDist++;
                     aggr.Add(c);
+                    aggrSpecies.Add(species);
                 }
                 // v2.7p: 每 ~6 秒打一行全流程计数(150fps 下 900 帧), 直接看出卡在哪一步
                 if (frame - lastCreSummary >= 900)
@@ -773,10 +776,9 @@ namespace SNMap
                     if (nb.Length > 32) Array.Resize(ref nb, 32);
                     PutInt(creatureRec, off + 8, nb.Length);
                     PutBytes(creatureRec, off + 12, nb);
-                    // 图标键 = TechType 名(对应内置的 icons/<key>.png), 大地图窗口拿它画生物头像
-                    TechTag tgi = aggr[i].GetComponent<TechTag>();
-                    if (tgi == null) { try { tgi = aggr[i].GetComponentInChildren<TechTag>(); } catch (Exception) { } }
-                    string key = tgi != null ? tgi.type.ToString() : null;
+                    // 图标键 = 物种名(对应内置的 icons/<key>.png), 大地图窗口拿它画生物头像
+                    // v2.7q: 用扫描时判定好的物种名(利维坦没有 TechTag, 靠 GameObject 名字反查得到)
+                    string key = i < aggrSpecies.Count ? aggrSpecies[i] : null;
                     byte[] kb = string.IsNullOrEmpty(key) ? new byte[0] : Encoding.UTF8.GetBytes(key);
                     if (kb.Length > 32) Array.Resize(ref kb, 32);
                     PutInt(creatureRec, off + 44, kb.Length);
@@ -809,12 +811,56 @@ namespace SNMap
         // 按设置窗口的勾选判断某物种是否显示:
         //   CreatureShow 键存在 -> 只显示列表里的(空 = 一个都不显示); "*" = 全部显示
         //   没有该键 -> 回落到 config.ini 的 CreatureWhitelist(空=全部)
-        private bool CreatureVisible(TechTag tg)
+        // v2.7q: 判定"这是什么物种"。
+        // 实测: 死神利维坦根对象与子物体上都没有可用的 TechTag(诊断行 有Tag=0) -> 白名单拿不到名字
+        // -> 整只被静默丢掉, 表现就是"利维坦就在眼前却不显示"。改成三级兜底:
+        //   1) TechTag(含未激活子物体)  2) GameObject 名字反查 TechType 枚举(大小写不敏感, 名字通常就是 TechType 名)
+        //   3) 去掉 (Clone) 的原名
+        private string SpeciesOf(Creature c, TechTag tg)
+        {
+            if (tg != null) return tg.type.ToString();
+            string n = null;
+            try { n = c.gameObject.name; } catch (Exception) { }
+            if (string.IsNullOrEmpty(n)) return null;
+            int p = n.IndexOf("(Clone)");
+            if (p >= 0) n = n.Substring(0, p);
+            n = n.Trim();
+            try
+            {
+                TechType tt;
+                if (Enum.TryParse<TechType>(n, true, out tt)) return tt.ToString();
+            }
+            catch (Exception) { }
+            return n;
+        }
+
+        // 按设置窗口的勾选判断某物种是否显示(参数是上面 SpeciesOf 得到的物种名):
+        //   CreatureShow 键存在 -> 只显示列表里的(空 = 一个都不显示); "*" = 全部显示
+        //   没有该键 -> 回落到 config.ini 的 CreatureWhitelist(空=全部)
+        // 用大小写不敏感的 HashSet, 既快又能容忍 "Boneshark" / "BoneShark" 这种拼写差异。
+        private HashSet<string> creatureShowSet;
+
+        private bool CreatureVisible(string species)
         {
             if (creatureShowAll) return true;
-            if (creatureShow != null) return tg != null && creatureShow.Contains(tg.type.ToString());
+            if (creatureShow != null)
+            {
+                if (creatureShowSet == null)
+                {
+                    creatureShowSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    for (int i = 0; i < creatureShow.Count; i++) creatureShowSet.Add(creatureShow[i]);
+                }
+                return species != null && creatureShowSet.Contains(species);
+            }
             if (Cfg.CreatureWhitelist == null) return true;
-            return tg != null && Cfg.CreatureWhitelist.Contains(tg.type);
+            if (species == null) return false;
+            try
+            {
+                TechType tt;
+                if (Enum.TryParse<TechType>(species, true, out tt)) return Cfg.CreatureWhitelist.Contains(tt);
+            }
+            catch (Exception) { }
+            return false;
         }
 
         // v2.7n 诊断: 某物种第一次因为某原因被筛掉时记一行(每物种每原因只记一次, 不刷屏)
@@ -1294,13 +1340,21 @@ namespace SNMap
             catch (Exception) { return big; }
         }
 
-        private static string CreatureName(Creature c)
+        private string CreatureName(Creature c)
         {
+            // v2.7q: 物种判定统一走 SpeciesOf(有些生物没有 TechTag, 靠名字反查), 这样中文名也能出来
             try
             {
                 TechTag tt = c.GetComponent<TechTag>();
-                if (tt == null) { try { tt = c.GetComponentInChildren<TechTag>(); } catch (Exception) { } }
+                if (tt == null) { try { tt = c.GetComponentInChildren<TechTag>(true); } catch (Exception) { } }
                 if (tt != null) return Language.main.Get(tt.type.AsString());
+                string sp = SpeciesOf(c, null);
+                if (!string.IsNullOrEmpty(sp))
+                {
+                    TechType t2;
+                    if (Enum.TryParse<TechType>(sp, true, out t2)) return Language.main.Get(t2.AsString());
+                    return sp;
+                }
             }
             catch (Exception) { }
             return c.gameObject.name.Replace("(Clone)", "");
