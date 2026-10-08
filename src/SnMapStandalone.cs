@@ -231,6 +231,7 @@ namespace SNMap
         private bool leviathanTried;
         private int iconLoaded;                                                // 只数"真正载入成功"的图标
         private int lastCreSummary = -100000;                                  // 生物扫描全流程计数日志的节流
+        private int lastMiniDrawLog = -100000;                                 // 小地图生物绘制计数日志的节流
 
         private static readonly string[] Headings = new string[]
         {
@@ -1705,16 +1706,28 @@ namespace SNMap
             }
 
             // 敌对生物: 小地图也画(有内置头像就画头像, 没有画黑描边红感叹号); 坐标每帧实时取
+            int mmDraw = 0;
+            string mmDbg = "";
             for (int i = 0; i < trackedCreatures.Count; i++)
             {
                 Creature c = trackedCreatures[i];
-                if (c == null) continue;
+                if (c == null) { if (mmDbg.Length < 140) mmDbg += "[空引用]"; continue; }
                 Vector3 q = c.transform.position;
-                if (q.x < winX0 || q.x > winX0 + spanWorld || q.z < winZ0 || q.z > winZ0 + spanWorld) continue;
+                if (q.x < winX0 || q.x > winX0 + spanWorld || q.z < winZ0 || q.z > winZ0 + spanWorld)
+                {
+                    if (mmDbg.Length < 140) mmDbg += "[窗外]";
+                    continue;
+                }
                 float mx = Mathf.Round(sq.x + (q.x - winX0) / spanWorld * D);
                 float my = Mathf.Round(sq.y + (1f - (q.z - winZ0) / spanWorld) * D);
-                if (Vector2.Distance(new Vector2(mx, my), sq.center) > D * 0.5f - 12f) continue;
+                if (Vector2.Distance(new Vector2(mx, my), sq.center) > D * 0.5f - 12f)
+                {
+                    if (mmDbg.Length < 140) mmDbg += "[" + (int)mx + "," + (int)my + "圆外r" + Mathf.RoundToInt(Vector2.Distance(new Vector2(mx, my), sq.center)) + "]";
+                    continue;
+                }
                 Texture2D cico = GetIconTex(i < trackedKeys.Count ? trackedKeys[i] : null);
+                mmDraw++;
+                if (mmDbg.Length < 140) mmDbg += "[" + (int)mx + "," + (int)my + (cico != null ? "有图" : "无图") + "]";
                 if (cico != null)
                 {
                     GUI.color = Color.white;
@@ -1724,6 +1737,13 @@ namespace SNMap
                 {
                     DrawAlertMark(mx, my);      // 没头像的生物: 黑描边红感叹号(原来是红点)
                 }
+            }
+            // v2.7r: 绘制侧计数(最多 ~4 秒一行), 用来定位"某只生物没画出来"是没收到/在窗外/被圆裁掉/没图标
+            if (frame - lastMiniDrawLog > 240)
+            {
+                lastMiniDrawLog = frame;
+                Cfg.Log("minimap creature: 追踪=" + trackedCreatures.Count + " 画=" + mmDraw +
+                        " 档=" + Mathf.RoundToInt(spanWorld) + "m D=" + Mathf.RoundToInt(D) + " " + mmDbg);
             }
 
             // 玩家箭头: 位置按同一套换算(贴图层边缘被 clamp 时会离开圆心, 这样才对得上底图);

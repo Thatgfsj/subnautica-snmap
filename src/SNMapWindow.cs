@@ -1056,13 +1056,23 @@ public class MapForm : Form
                 g.Restore(state);
             }
 
-            if (showCreatures)
+            // v2.7r: 去掉原来这里的 if (showCreatures) 门控 —— 模块在开关关掉时本来就会把数量写成 0,
+            // 窗口再拿自己那份可能过期的标志挡一道, 只会造成"设置里明明是开着的、图上却没有"。
             {
+                int cTotal = creatureWin.Count, cInView = 0, cIcon = 0;
+                string cDbg = "";
                 foreach (CreaturePt c in creatureWin)
                 {
                     PointF cp = WorldToScreen(L, c.X, c.Z);
-                    if (cp.X < r.X - 20f || cp.Y < r.Y - 20f || cp.X > r.Right + 20f || cp.Y > r.Bottom + 20f) continue;
+                    if (cp.X < r.X - 20f || cp.Y < r.Y - 20f || cp.X > r.Right + 20f || cp.Y > r.Bottom + 20f)
+                    {
+                        if (cDbg.Length < 150) cDbg += "[" + (int)cp.X + "," + (int)cp.Y + "屏外]";
+                        continue;
+                    }
+                    cInView++;
                     Image cic = GetIcon(c.Key);
+                    if (cic != null) cIcon++;
+                    if (cDbg.Length < 150) cDbg += "[" + (int)cp.X + "," + (int)cp.Y + (cic != null ? "有图" : "无图") + "]";
                     if (cic != null)
                     {
                         // 生物头像(内置 icons/<TechType>.png) —— 直接画, 不垫黑方块(否则透明边会变成黑边)
@@ -1076,6 +1086,15 @@ public class MapForm : Form
                     }
                     if (!string.IsNullOrEmpty(c.Label))
                         DrawShadowText(g, c.Label, smallFont, cp.X + 13f, cp.Y - 8f);
+                }
+                // v2.7r: 绘制侧计数(最多 5 秒一行)。用来定位"某只生物没画出来"到底是
+                // 没收到、在视野外、还是图标没载入。
+                if (Environment.TickCount - lastCreatureDrawLog > 5000)
+                {
+                    lastCreatureDrawLog = Environment.TickCount;
+                    WinLog("creature draw: 列表=" + cTotal + " 视野内=" + cInView + " 有图标=" + cIcon +
+                           " 缩放=" + zoom.ToString("F2") + " 视口=" + (int)r.X + "," + (int)r.Y + " " +
+                           (int)r.Width + "x" + (int)r.Height + " 跟随=" + follow + "  " + cDbg);
                 }
             }
 
@@ -1129,6 +1148,7 @@ public class MapForm : Form
     // 内置图标(icons/<TechType>.png)按需加载 + 缓存; 没有图标就退回"黑描边红感叹号"
     private readonly Dictionary<string, Image> iconCache = new Dictionary<string, Image>();
     private int iconLoaded;                                   // v2.7n: 只数真正载入成功的
+    private int lastCreatureDrawLog;                          // v2.7r: 绘制侧计数日志的节流
 
     private Image GetIcon(string key)
     {
