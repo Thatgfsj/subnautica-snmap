@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.7w";  // 模块版本: w=审查修复(扫描室空数组重扫/全部节流改真实时间/OnDestroy 清理/诊断串只在打日志那帧拼)
+        public const string Version = "2.7x";  // 模块版本: x=实例级物种/AI 缓存 + 去掉"必须有攻击组件"门控(实测 采用=0 与 13~19ms)
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -765,45 +765,51 @@ namespace SNMap
                     if (c == null || !c.gameObject.activeInHierarchy) continue;
                     nActive++;
                     float dsq0 = (c.transform.position - pp).sqrMagnitude;
-                    TechTag tg = null;
-                    try { tg = c.GetComponent<TechTag>(); } catch (Exception) { }
-                    // v2.7p/q: TechTag 也可能挂在(未激活的)子物体上; 实测利维坦根本没有 TechTag,
-                    // 所以下面用 SpeciesOf 再兜两层(GameObject 名字反查 TechType 枚举)
-                    if (tg == null) { try { tg = c.GetComponentInChildren<TechTag>(true); } catch (Exception) { } }
-                    string species = SpeciesOf(c, tg);
-                    if (tg != null) nTag++;
+                    // v2.7x: 每个实例只解析一次"物种名 + 有没有攻击组件", 之后只查表。
+                    // 实测 108 只生物时一次扫描 13~19ms, 主要就是这里: 没有根 TechTag 的生物要
+                    // GetComponentInChildren<TechTag>(true)(整棵子树) + 反查 TechType 枚举(反射)。
+                    // 对同一个实例这两件事的结果永远一样, 缓存后重扫几乎是零成本。
+                    int cid = 0;
+                    try { cid = c.GetInstanceID(); } catch (Exception) { }
+                    string species;
+                    bool rootAI;
+                    if (cid == 0 || !speciesById.TryGetValue(cid, out species) || !aiById.TryGetValue(cid, out rootAI))
+                    {
+                        TechTag tg = null;
+                        try { tg = c.GetComponent<TechTag>(); } catch (Exception) { }
+                        // v2.7p/q: TechTag 也可能挂在(未激活的)子物体上; 实测利维坦根本没有 TechTag,
+                        // 所以 SpeciesOf 还会兜两层(GameObject 名字反查 TechType 枚举)
+                        if (tg == null) { try { tg = c.GetComponentInChildren<TechTag>(true); } catch (Exception) { } }
+                        species = SpeciesOf(c, tg);
+                        if (tg != null) nTag++;
+                        rootAI = c.GetComponent<AggressiveWhenSeeTarget>() != null || c.GetComponent<AttackLastTarget>() != null;
+                        if (cid != 0)
+                        {
+                            if (speciesById.Count > 4096) { speciesById.Clear(); aiById.Clear(); }
+                            speciesById[cid] = species;
+                            aiById[cid] = rootAI;
+                        }
+                    }
                     if (dsq0 < bestDsq)
                     {
                         bestDsq = dsq0;
-                        bestDesc = (species != null ? species : "?") + (tg == null ? "(无Tag)" : "") + "/" +
-                                   c.gameObject.name + "@" + Mathf.RoundToInt(Mathf.Sqrt(dsq0)) + "m rAI=" +
-                                   (c.GetComponent<AggressiveWhenSeeTarget>() != null || c.GetComponent<AttackLastTarget>() != null ? 1 : 0);
+                        bestDesc = (species != null ? species : "?") + "/" + c.gameObject.name + "@" +
+                                   Mathf.RoundToInt(Mathf.Sqrt(dsq0)) + "m rAI=" + (rootAI ? 1 : 0);
                     }
-                    // 根对象上的攻击组件(便宜)
-                    bool rootAI = c.GetComponent<AggressiveWhenSeeTarget>() != null || c.GetComponent<AttackLastTarget>() != null;
-                    // 物种清单: 不管当前勾没勾显示, 见过就记下来(设置窗口要能列出全部敌对生物)
-                    if (rootAI && species != null)
-                    {
-                        if (species.Length > 0 && seenSpecies.Count < Proto.MaxSpecies && !seenSpecies.Contains(species))
-                            seenSpecies.Add(species);
-                    }
-                    // v2.7o: 先做便宜的白名单判断, 再做贵的"子物体找 AI"。
-                    // GetComponentInChildren 会走整棵子物体树, 而场景里几百条鱼全部都不通过根检查 ->
-                    // 每条鱼两次子物体搜索 = 5ms 级别的周期性卡顿(自检日志里 beacon=4.5~5.8ms 就是它)。
+                    // 物种清单: 见过就记下来(设置窗口要能列出全部敌对生物)
+                    if (rootAI && species != null && species.Length > 0 &&
+                        seenSpecies.Count < Proto.MaxSpecies && !seenSpecies.Contains(species))
+                        seenSpecies.Add(species);
+                    // v2.7x: 去掉"必须找到攻击组件"这道门控。
+                    // 白名单本来就是"用户勾了它才显示"的意思, 而内置物种表里有些物种(Crash/Biter 等)用的
+                    // 不是这两个组件类 -> 被整批筛掉。实测日志: 白名单内=7 有AI=0 采用=0(地图上一只都没有)。
+                    // 顺带这也把原来"每条鱼两次子物体搜索"的巨额开销彻底去掉(见上方的实例缓存)。
                     if (!CreatureVisible(species))
                     {
                         LogSkipOnce(species != null ? species : c.gameObject.name, "不在显示清单(设置里没勾)");
                         continue;
                     }
                     nWhite++;
-                    // 只有白名单里的物种才值得补这一层(有些生物把 AI 挂子物体, 只查根对象会整只丢掉)
-                    if (!rootAI &&
-                        c.GetComponentInChildren<AggressiveWhenSeeTarget>() == null &&
-                        c.GetComponentInChildren<AttackLastTarget>() == null)
-                    {
-                        LogSkipOnce(species, "没有攻击组件");
-                        continue;
-                    }
                     nAI++;
                     // v2.7n: 距离上限 600m -> 1500m。利维坦又大又稀疏, 经常在 600m 外,
                     // 大地图本来就能缩放平移看远处, 卡在 600m 会让"利维坦不显示"。
@@ -910,6 +916,9 @@ namespace SNMap
         }
         private readonly List<CreEntry> crePending = new List<CreEntry>();
         private float lastCreatureTime = -100f;   // 按"真实时间"节流, 不受帧率影响
+        // v2.7x: 每个生物实例的"物种名 + 有无攻击组件"缓存(实测把一次扫描 13~19ms 降到几乎只剩 FindObjectsOfType)
+        private readonly Dictionary<int, string> speciesById = new Dictionary<int, string>();
+        private readonly Dictionary<int, bool> aiById = new Dictionary<int, bool>();
         // 上一次扫描到的生物记录 + 给绘制用的生物引用。
         // 状态文件每帧都会 Array.Clear, 而"有哪些生物"只在每 60 帧(≈1秒)扫一次 ->
         // 记录要持久保存每帧原样写回; 而且位置必须每帧从 transform 实时取,
