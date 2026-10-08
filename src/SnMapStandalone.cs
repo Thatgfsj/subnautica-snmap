@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.7o";  // 模块版本: 日志 + 状态文件; o=生物扫描开销收尾(便宜的判断提前)
+        public const string Version = "2.7p";  // 模块版本: 日志 + 状态文件; p=生物扫描全流程诊断 + TechTag 子物体兜底
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -229,6 +229,7 @@ namespace SNMap
         private Type leviathanType;
         private bool leviathanTried;
         private int iconLoaded;                                                // 只数"真正载入成功"的图标
+        private int lastCreSummary = -100000;                                  // 生物扫描全流程计数日志的节流
 
         private static readonly string[] Headings = new string[]
         {
@@ -675,11 +676,30 @@ namespace SNMap
                 Creature[] all = UnityEngine.Object.FindObjectsOfType<Creature>();
                 List<Creature> aggr = aggrCache;      // 复用, 不再每次扫描 new 一个 List
                 aggr.Clear();
+                // v2.7p 诊断: 全流程计数 + 记录最近的一只(用来确认"利维坦到底走到哪一步被丢了")
+                int nActive = 0, nTag = 0, nAI = 0, nWhite = 0, nDist = 0;
+                float bestDsq = float.MaxValue;
+                string bestDesc = "-";
                 for (int ci = 0; ci < all.Length; ci++)
                 {
                     Creature c = all[ci];
                     if (c == null || !c.gameObject.activeInHierarchy) continue;
+                    nActive++;
+                    float dsq0 = (c.transform.position - pp).sqrMagnitude;
                     TechTag tg = c.GetComponent<TechTag>();
+                    // v2.7p: TechTag 也可能挂在子物体上 —— 查不到时原来会静默丢弃整只生物(一句话都不记)
+                    if (tg == null)
+                    {
+                        try { tg = c.GetComponentInChildren<TechTag>(); } catch (Exception) { }
+                    }
+                    if (tg != null) nTag++;
+                    if (dsq0 < bestDsq)
+                    {
+                        bestDsq = dsq0;
+                        bestDesc = (tg != null ? tg.type.ToString() : "?tag") + "/" + c.gameObject.name +
+                                   "@" + Mathf.RoundToInt(Mathf.Sqrt(dsq0)) + "m rAI=" +
+                                   (c.GetComponent<AggressiveWhenSeeTarget>() != null || c.GetComponent<AttackLastTarget>() != null ? 1 : 0);
+                    }
                     // 根对象上的攻击组件(便宜)
                     bool rootAI = c.GetComponent<AggressiveWhenSeeTarget>() != null || c.GetComponent<AttackLastTarget>() != null;
                     // 物种清单: 不管当前勾没勾显示, 见过就记下来(设置窗口要能列出全部敌对生物)
@@ -694,26 +714,38 @@ namespace SNMap
                     // 每条鱼两次子物体搜索 = 5ms 级别的周期性卡顿(自检日志里 beacon=4.5~5.8ms 就是它)。
                     if (!CreatureVisible(tg))
                     {
-                        if (tg != null) LogSkipOnce(tg.type.ToString(), "设置里没勾选/不在白名单");
+                        LogSkipOnce(tg != null ? tg.type.ToString() : c.gameObject.name, "不在显示清单(设置里没勾/无Tag)");
                         continue;
                     }
+                    nWhite++;
                     // 只有白名单里的物种才值得补这一层(有些生物把 AI 挂子物体, 只查根对象会整只丢掉)
                     if (!rootAI &&
                         c.GetComponentInChildren<AggressiveWhenSeeTarget>() == null &&
                         c.GetComponentInChildren<AttackLastTarget>() == null)
                     {
-                        if (tg != null) LogSkipOnce(tg.type.ToString(), "没有攻击组件");
+                        LogSkipOnce(tg.type.ToString(), "没有攻击组件");
                         continue;
                     }
+                    nAI++;
                     // v2.7n: 距离上限 600m -> 1500m。利维坦又大又稀疏, 经常在 600m 外,
                     // 大地图本来就能缩放平移看远处, 卡在 600m 会让"利维坦不显示"。
-                    float dsq = (c.transform.position - pp).sqrMagnitude;
-                    if (dsq > 2250000f)      // 1500m
+                    if (dsq0 > 2250000f)      // 1500m
                     {
-                        if (tg != null) LogSkipOnce(tg.type.ToString(), "太远(>1500m)");
+                        LogSkipOnce(tg.type.ToString(), "太远(>1500m)");
                         continue;
                     }
+                    nDist++;
                     aggr.Add(c);
+                }
+                // v2.7p: 每 ~6 秒打一行全流程计数(150fps 下 900 帧), 直接看出卡在哪一步
+                if (frame - lastCreSummary >= 900)
+                {
+                    lastCreSummary = frame;
+                    Cfg.Log("creature scan: 全部=" + all.Length + " 激活=" + nActive + " 有Tag=" + nTag +
+                            " 白名单内=" + nWhite + " 有AI=" + nAI + " 距离内=" + nDist +
+                            " 采用=" + aggr.Count + " show=" + showCreatures +
+                            " 清单=" + (creatureShow == null ? "null" : creatureShow.Count.ToString()) +
+                            " 最近=" + bestDesc);
                 }
                 // v2.7n: 排序加权 —— 有利维坦组件的排最前。
                 // 原来是纯按距离取最近 24 个, 利维坦远处很容易被一群小鱼挤掉名额, 表现就是"利维坦不显示"。
@@ -743,6 +775,7 @@ namespace SNMap
                     PutBytes(creatureRec, off + 12, nb);
                     // 图标键 = TechType 名(对应内置的 icons/<key>.png), 大地图窗口拿它画生物头像
                     TechTag tgi = aggr[i].GetComponent<TechTag>();
+                    if (tgi == null) { try { tgi = aggr[i].GetComponentInChildren<TechTag>(); } catch (Exception) { } }
                     string key = tgi != null ? tgi.type.ToString() : null;
                     byte[] kb = string.IsNullOrEmpty(key) ? new byte[0] : Encoding.UTF8.GetBytes(key);
                     if (kb.Length > 32) Array.Resize(ref kb, 32);
@@ -1266,6 +1299,7 @@ namespace SNMap
             try
             {
                 TechTag tt = c.GetComponent<TechTag>();
+                if (tt == null) { try { tt = c.GetComponentInChildren<TechTag>(); } catch (Exception) { } }
                 if (tt != null) return Language.main.Get(tt.type.AsString());
             }
             catch (Exception) { }
