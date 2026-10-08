@@ -739,6 +739,7 @@ namespace SNMap
                 // 之前是"把房间里所有可扫描类型全铺出来", 所以小地图上会有一大堆不相干的点。
                 int activeRooms = 0;
                 int perRoom = 16;
+                bool diag = frame % 300 == 0;      // 每 5 秒打一次逐房间诊断
                 for (int r = 0; r < rooms.Length && scanNodePos.Count < 48; r++)
                 {
                     MapRoomFunctionality room = rooms[r];
@@ -752,9 +753,19 @@ namespace SNMap
                         act = room.GetActiveTechType();
                         range = room.GetScanRange();
                     }
-                    catch (Exception) { continue; }
-                    if (act == TechType.None) continue;                       // 这个房间空闲/没在扫描
-                    if ((rp - pp).sqrMagnitude > 640000f) continue;            // 房间离玩家 >800m 不管
+                    catch (Exception ex)
+                    {
+                        if (scanErrLogged < 3) { scanErrLogged++; Cfg.Log("房间读取失败: " + ex.Message); }
+                        continue;
+                    }
+                    int roomDist = Mathf.RoundToInt(Mathf.Sqrt((rp - pp).sqrMagnitude));
+                    // 不再按"离玩家多远"筛房间: 远处基地扫出来的东西同样有价值(大地图可以平移过去看),
+                    // 小地图那边本来就会按自己的显示窗口裁切 -> 放开, 每个正在扫描的房间都收。
+                    if (act == TechType.None)
+                    {
+                        if (diag) Cfg.Log("  room#" + r + " 距离=" + roomDist + "m 空闲(没在扫描)");
+                        continue;
+                    }
 
                     activeRooms++;
                     string key = act.ToString();
@@ -777,12 +788,13 @@ namespace SNMap
                         if (nt != act) continue;                               // 保险: 只要这个房间正在扫的类型
                         Vector3 pos = (Vector3)riPosF.GetValue(info);
                         if ((pos - rp).sqrMagnitude > lim * lim) continue;      // 超出该房间的扫描范围
-                        if ((pos - pp).sqrMagnitude > 640000f) continue;        // 离玩家太远
                         scanNodePos.Add(pos);
                         scanNodeKey.Add(key);
                         scanNodeName.Add(cn);
                         taken++;
                     }
+                    if (diag) Cfg.Log("  room#" + r + " 距离=" + roomDist + "m 正在扫=" + key +
+                                      " range=" + Mathf.RoundToInt(range) + " 取到=" + taken);
                 }
                 if (frame % 300 == 0)
                     Cfg.Log("scanner: rooms=" + rooms.Length + " 在扫描=" + activeRooms +
