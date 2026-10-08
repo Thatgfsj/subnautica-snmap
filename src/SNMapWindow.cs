@@ -67,12 +67,16 @@ internal class CreaturePt
 
 public class MapForm : Form
 {
-    private const int OffMagic = 0, OffVersion = 4, OffTick = 8;
-    private const int OffPlayerValid = 16, OffX = 20, OffY = 24, OffZ = 28, OffHeading = 32;
-    private const int OffShowWindow = 36, OffModVerLen = 40, OffModVer = 44;
-    private const int OffBeaconCount = 80, OffBiomeLen = 84, OffBiome = 88;
-    private const int OffBeacons = 128;
-    private const int OffCreatureCount = 4268, OffCreatures = 4272;
+    // v2.7u: 一律指向共享协议常量。
+    // 窗口以前自带一套局部偏移字面量, 而 v4 给信标记录加"图标键/kind"时把 OffBeacons 从 128 推到了 160,
+    // 只改了共享侧 -> 窗口仍按 128 读, 每条记录整体偏 32 字节(X/Z 落进群系 UTF8 文本里 -> 乱坐标/NaN),
+    // 而两边 Version 都是 5, 版本校验也抓不到这种"版本内布局漂移"。现在全部由 Proto 提供, 物理上不可能再漂。
+    private const int OffMagic = Proto.OffMagic, OffVersion = Proto.OffVersion, OffTick = Proto.OffTick;
+    private const int OffPlayerValid = Proto.OffPlayerValid, OffX = Proto.OffX, OffY = Proto.OffY, OffZ = Proto.OffZ, OffHeading = Proto.OffHeading;
+    private const int OffShowWindow = Proto.OffShowWindow, OffModVerLen = Proto.OffModVerLen, OffModVer = Proto.OffModVer;
+    private const int OffBeaconCount = Proto.OffBeaconCount, OffBiomeLen = Proto.OffBiomeLen, OffBiome = Proto.OffBiome;
+    private const int OffBeacons = Proto.OffBeacons;
+    private const int OffCreatureCount = Proto.OffCreatureCount, OffCreatures = Proto.OffCreatures;
     private const int Magic = Proto.Magic, ProtoVersion = Proto.Version;
 
     private static readonly Color ThemeBg = Color.FromArgb(232, 241, 252);

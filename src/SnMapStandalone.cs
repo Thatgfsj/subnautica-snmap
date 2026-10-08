@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.7t";  // 模块版本: 日志 + 状态文件; t=修"同位置图标一直换"(物种名漏了跟着排序重排)
+        public const string Version = "2.7u";  // 模块版本: u=审查修复(信标区持久化/F9翻转基准/写失败日志/设置读一遍)
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -231,6 +231,14 @@ namespace SNMap
         private int iconLoaded;                                                // 只数"真正载入成功"的图标
         private int lastCreSummary = -100000;                                  // 生物扫描全流程计数日志的节流
         private int lastMiniDrawLog = -100000;                                 // 小地图生物绘制计数日志的节流
+        // v2.7u: 信标/扫描室物品点与群系文本的持久缓存。
+        // WriteState 每次都 Array.Clear, 而这两块只在每 30 帧(≈2Hz)重算一次 ->
+        // 中间 8~9 次写盘是"计数 0、整区为 0", 窗口 30Hz 采样大部分看到 0 条 =
+        // 大地图上信标/扫描室物品点 ~2Hz 频闪(用户报的"扫描室物品不显示")。
+        private readonly byte[] beaconRec = new byte[Proto.MaxBeacons * 128];
+        private int beaconCountCache;
+        private byte[] biomeCache = new byte[0];
+        private int biomeLenCache;
 
         private static readonly string[] Headings = new string[]
         {
@@ -278,9 +286,9 @@ namespace SNMap
         {
             if (keyMapOk && Input.GetKeyDown(keyMap))
             {
-                // 读-翻转-写 设置文件里的 ShowWindow(与地图窗口共用)
-                byte cur = ReadSettingsByte(Proto.KeyShowWindow, 0);
-                showWindow = cur == 0;
+                // v2.7u: 以模块自己记录的显示状态取反, 不再读 ini 当翻转基准。
+                // ini 会被窗口多处写(启动/跟随/退出/设置), 读到过期值时"翻转方向"就错 -> 表现成"F9 偶尔没反应"。
+                showWindow = !showWindow;
                 WriteSettingsKey(Proto.KeyShowWindow, showWindow ? "1" : "0");
                 settingsShowWindow = showWindow ? (byte)1 : (byte)0;
             }
@@ -347,7 +355,10 @@ namespace SNMap
                     int wi;
                     if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out wi)) windowLayer = wi;
                 }
-                byte sw = ReadSettingsByte(Proto.KeyShowWindow, 0);
+                // v2.7u: 用上面已经读到的这份 dict, 不再单独 ReadSettingsByte 重读一遍文件。
+                // 两次读之间对方可能替换文件, 那样会取到"两个不同版本"的键(10Hz 内虽会自纠, 但白读一次盘)。
+                byte sw = 0;
+                if (d.TryGetValue(Proto.KeyShowWindow, out s)) byte.TryParse(s, out sw);
                 settingsShowWindow = sw;
                 showWindow = sw != 0;
                 return wt;
@@ -462,13 +473,22 @@ namespace SNMap
                     try { biome = Proto.BiomeCnOrNull(pl.GetBiomeString()); } catch (Exception) { }
                     byte[] b = biome == null ? new byte[0] : Encoding.UTF8.GetBytes(biome);
                     if (b.Length > 63) Array.Resize(ref b, 63);
-                    PutInt(buf, Proto.OffBiomeLen, b.Length);
-                    PutBytes(buf, Proto.OffBiome, b);
+                    biomeLenCache = b.Length;
+                    biomeCache = b;
                     float tb = Time.realtimeSinceStartup;
                     WriteBeacons(pl, buf);
                     float db = (Time.realtimeSinceStartup - tb) * 1000f;
                     if (db > perfBeaconMs) perfBeaconMs = db;
                 }
+                // v2.7u: 群系与信标区改成"持久缓存 + 每次写盘原样写回"。
+                // 上面那段只在每 30 帧(≈2Hz)执行, 而本方法开头每次都 Array.Clear ->
+                // 其余 8~9 次写盘是"群系空、信标计数 0、整区为 0";
+                // 窗口 30Hz 采样大部分看到 0 条 -> 大地图上信标与扫描室物品点 ~2Hz 频闪
+                // (用户报的"扫描室物品不显示"就是这个)。生物/物种早就是这么做的, 信标漏了。
+                PutInt(buf, Proto.OffBiomeLen, biomeLenCache);
+                if (biomeLenCache > 0 && biomeCache != null) PutBytes(buf, Proto.OffBiome, biomeCache);
+                PutInt(buf, Proto.OffBeaconCount, beaconCountCache);
+                Buffer.BlockCopy(beaconRec, 0, buf, Proto.OffBeacons, beaconRec.Length);
                 PutInt(buf, Proto.OffCreatureCount, creatureCount);
                 // 位置每帧实时刷新(生物引用是 1 秒前扫出来的集合, 但坐标必须跟手, 否则标记会一顿一顿地跳)
                 for (int i = 0; i < trackedCreatures.Count; i++)
@@ -519,8 +539,11 @@ namespace SNMap
                     stateFs.Position = 0;
                     stateFs.Write(buf, 0, buf.Length);
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
+                    // v2.7u: 这里原来是空的 catch —— 磁盘满/被杀软独占/句柄失效时,
+                    // 玩家看到的是"地图永远不动"而日志里一个字都没有。按 10 秒节流记一条。
+                    if (frame % 600 == 0) Cfg.Log("state write failed: " + ex.Message);
                     // 句柄坏了(文件被删/被独占) -> 丢掉句柄下次重建
                     try { if (stateFs != null) stateFs.Dispose(); } catch (Exception) { }
                     stateFs = null;
@@ -606,29 +629,30 @@ namespace SNMap
                 return (pa - pp).sqrMagnitude.CompareTo((pb - pp).sqrMagnitude);
             });
             int n = Mathf.Min(sorted.Count, Proto.MaxBeacons);
-            PutInt(buf, Proto.OffBeaconCount, n);
+            // v2.7u: 写进"持久缓冲"(相对偏移), 由 WriteState 每次写盘原样拷进状态文件
+            Array.Clear(beaconRec, 0, beaconRec.Length);
             for (int i = 0; i < n; i++)
             {
                 PingInstance pi = sorted[i];
                 Vector3 q = pi.GetPosition();
                 bool isScan = pi.pingType == PingType.Signal;
-                int off = Proto.OffBeacons + i * 128;
-                PutFloat(buf, off, Q(q.x));
-                PutFloat(buf, off + 4, Q(q.z));
-                PutInt(buf, off + 8, pi.colorIndex >= 0 ? pi.colorIndex : 0);
-                PutInt(buf, off + 12, 1);
+                int off = i * 128;
+                PutFloat(beaconRec, off, Q(q.x));
+                PutFloat(beaconRec, off + 4, Q(q.z));
+                PutInt(beaconRec, off + 8, pi.colorIndex >= 0 ? pi.colorIndex : 0);
+                PutInt(beaconRec, off + 12, 1);
                 string lbl = pi.GetLabel();
                 byte[] b = string.IsNullOrEmpty(lbl) ? new byte[0] : Encoding.UTF8.GetBytes(lbl);
                 if (b.Length > 63) Array.Resize(ref b, 63);
-                PutInt(buf, off + 16, b.Length);
-                PutBytes(buf, off + 20, b);
+                PutInt(beaconRec, off + 16, b.Length);
+                PutBytes(beaconRec, off + 20, b);
                 // 图标键: 扫描信号只有本地化名字(石灰岩块...), 反查成 TechType(Limestone) 才能找到内置图标
                 string key = isScan ? IconKeyForLabel(lbl) : null;
                 byte[] kb = string.IsNullOrEmpty(key) ? new byte[0] : Encoding.UTF8.GetBytes(key);
                 if (kb.Length > 32) Array.Resize(ref kb, 32);
-                PutInt(buf, off + 84, kb.Length);
-                PutBytes(buf, off + 88, kb);
-                buf[off + 120] = isScan ? (byte)1 : (byte)0;
+                PutInt(beaconRec, off + 84, kb.Length);
+                PutBytes(beaconRec, off + 88, kb);
+                beaconRec[off + 120] = isScan ? (byte)1 : (byte)0;
             }
 
             // 扫描室物品点: 排在真实 ping 之后, 占剩下的槽位(kind=2, 带物品图标键)
@@ -636,24 +660,24 @@ namespace SNMap
             int total = n;
             for (int i = 0; i < scanNodePos.Count && total < Proto.MaxBeacons; i++, total++)
             {
-                int off = Proto.OffBeacons + total * 128;
+                int off = total * 128;
                 Vector3 q = scanNodePos[i];
-                PutFloat(buf, off, Q(q.x));
-                PutFloat(buf, off + 4, Q(q.z));
-                PutInt(buf, off + 8, 0);
-                PutInt(buf, off + 12, 1);
+                PutFloat(beaconRec, off, Q(q.x));
+                PutFloat(beaconRec, off + 4, Q(q.z));
+                PutInt(beaconRec, off + 8, 0);
+                PutInt(beaconRec, off + 12, 1);
                 string nm = scanNodeName[i];
                 byte[] b = string.IsNullOrEmpty(nm) ? new byte[0] : Encoding.UTF8.GetBytes(nm);
                 if (b.Length > 63) Array.Resize(ref b, 63);
-                PutInt(buf, off + 16, b.Length);
-                PutBytes(buf, off + 20, b);
+                PutInt(beaconRec, off + 16, b.Length);
+                PutBytes(beaconRec, off + 20, b);
                 byte[] kb2 = Encoding.UTF8.GetBytes(scanNodeKey[i]);
                 if (kb2.Length > 32) Array.Resize(ref kb2, 32);
-                PutInt(buf, off + 84, kb2.Length);
-                PutBytes(buf, off + 88, kb2);
-                buf[off + 120] = 2;
+                PutInt(beaconRec, off + 84, kb2.Length);
+                PutBytes(beaconRec, off + 88, kb2);
+                beaconRec[off + 120] = 2;
             }
-            PutInt(buf, Proto.OffBeaconCount, total);
+            beaconCountCache = total;      // 由 WriteState 每次写盘带上(否则中间帧是"0 条" -> 大地图频闪)
 
             // 攻击性生物(每 20 帧≈0.33秒 扫一次, 取最近 24 只, 600m 内)
             // 原来 60 帧(1秒)一次, 生物位置最多滞后 1 秒, 看起来就是"不刷新"
