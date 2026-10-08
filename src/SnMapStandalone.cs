@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.7x";  // 模块版本: x=实例级物种/AI 缓存 + 去掉"必须有攻击组件"门控(实测 采用=0 与 13~19ms)
+        public const string Version = "2.7y";  // 模块版本: y=日志轮转(512KB 轮转成 .1); 2.7x=实例级物种/AI 缓存 + 去掉攻击组件门控
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
