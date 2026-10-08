@@ -1026,8 +1026,9 @@ public class MapForm : Form
                 if (bic != null)
                 {
                     // 扫描室扫描的物品: 直接画游戏里的物品图标
+                    // (原来在底下垫了一层半透明黑方块想"在浅色地图上也看得清", 结果图标有透明边时
+                    //  黑方块就从边上透出来 -> 看起来像黑边/黑框, 已去掉)
                     Rectangle ir = new Rectangle((int)(sp.X - 10f), (int)(sp.Y - 10f), 20, 20);
-                    g.FillRectangle(shadowBrush, ir);
                     g.DrawImage(bic, ir);
                 }
                 else
@@ -1064,9 +1065,8 @@ public class MapForm : Form
                     Image cic = GetIcon(c.Key);
                     if (cic != null)
                     {
-                        // 生物头像(内置 icons/<TechType>.png)
+                        // 生物头像(内置 icons/<TechType>.png) —— 直接画, 不垫黑方块(否则透明边会变成黑边)
                         Rectangle ir = new Rectangle((int)(cp.X - 12f), (int)(cp.Y - 12f), 24, 24);
-                        g.FillRectangle(shadowBrush, ir);
                         g.DrawImage(cic, ir);
                     }
                     else
