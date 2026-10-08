@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.7n";  // 模块版本: 日志 + 状态文件; n=生物显示修复(利维坦/漏显示/图标名额)
+        public const string Version = "2.7o";  // 模块版本: 日志 + 状态文件; o=生物扫描开销收尾(便宜的判断提前)
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -664,7 +664,10 @@ namespace SNMap
             }
             // v2.7m: 生物"有哪些"每 2 秒重扫一次就够(坐标是每帧实时取的, 显示依旧跟手),
             // 原来 ~1 秒一次; FindObjectsOfType<Creature>() 要把场景对象都走一遍, 是这里最大的一笔开销。
-            if (frame % 40 != 0 && lastCreatureFrame != 0 && frame - lastCreatureFrame < 40) return;
+            // v2.7o: 40 -> 36: 和 WriteBeacons 的 30 帧节流取最小公倍数, 实际是每 180 帧(60fps 下 3 秒)
+            // 重扫一次"有哪些生物"。FindObjectsOfType<Creature>() 要把场景对象走一遍(实测 5ms 级别),
+            // 坐标仍然是每帧实时取的, 所以显示照样跟手, 只是新进入范围的生物晚最多 3 秒出现。
+            if (frame % 36 != 0 && lastCreatureFrame != 0 && frame - lastCreatureFrame < 36) return;
             lastCreatureFrame = frame;
             float tCre = Time.realtimeSinceStartup;
             try
@@ -677,24 +680,29 @@ namespace SNMap
                     Creature c = all[ci];
                     if (c == null || !c.gameObject.activeInHierarchy) continue;
                     TechTag tg = c.GetComponent<TechTag>();
-                    // v2.7n: 攻击组件原来只在根对象上找(GetComponent 不查子物体), 有些生物把 AI 挂子物体 ->
-                    // 整只被丢掉("部分生物加载不出来")。现在补一层 GetComponentInChildren。
-                    if (c.GetComponent<AggressiveWhenSeeTarget>() == null && c.GetComponent<AttackLastTarget>() == null &&
-                        c.GetComponentInChildren<AggressiveWhenSeeTarget>() == null && c.GetComponentInChildren<AttackLastTarget>() == null)
-                    {
-                        if (tg != null) LogSkipOnce(tg.type.ToString(), "没有攻击组件");
-                        continue;
-                    }
+                    // 根对象上的攻击组件(便宜)
+                    bool rootAI = c.GetComponent<AggressiveWhenSeeTarget>() != null || c.GetComponent<AttackLastTarget>() != null;
                     // 物种清单: 不管当前勾没勾显示, 见过就记下来(设置窗口要能列出全部敌对生物)
-                    if (tg != null)
+                    if (rootAI && tg != null)
                     {
                         string sp = tg.type.ToString();
                         if (sp.Length > 0 && seenSpecies.Count < Proto.MaxSpecies && !seenSpecies.Contains(sp))
                             seenSpecies.Add(sp);
                     }
+                    // v2.7o: 先做便宜的白名单判断, 再做贵的"子物体找 AI"。
+                    // GetComponentInChildren 会走整棵子物体树, 而场景里几百条鱼全部都不通过根检查 ->
+                    // 每条鱼两次子物体搜索 = 5ms 级别的周期性卡顿(自检日志里 beacon=4.5~5.8ms 就是它)。
                     if (!CreatureVisible(tg))
                     {
                         if (tg != null) LogSkipOnce(tg.type.ToString(), "设置里没勾选/不在白名单");
+                        continue;
+                    }
+                    // 只有白名单里的物种才值得补这一层(有些生物把 AI 挂子物体, 只查根对象会整只丢掉)
+                    if (!rootAI &&
+                        c.GetComponentInChildren<AggressiveWhenSeeTarget>() == null &&
+                        c.GetComponentInChildren<AttackLastTarget>() == null)
+                    {
+                        if (tg != null) LogSkipOnce(tg.type.ToString(), "没有攻击组件");
                         continue;
                     }
                     // v2.7n: 距离上限 600m -> 1500m。利维坦又大又稀疏, 经常在 600m 外,
