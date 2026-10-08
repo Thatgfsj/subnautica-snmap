@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.7q";  // 模块版本: 日志 + 状态文件; q=利维坦没有 TechTag -> 用 GameObject 名字反查物种
+        public const string Version = "2.7t";  // 模块版本: 日志 + 状态文件; t=修"同位置图标一直换"(物种名漏了跟着排序重排)
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -226,7 +226,6 @@ namespace SNMap
         private int perfFrames;
         // v2.7n 生物显示相关
         private readonly HashSet<string> skipLogged = new HashSet<string>();   // 被筛掉的物种只记一次, 不刷屏
-        private readonly List<string> aggrSpecies = new List<string>();        // 与 aggrCache 对齐的物种名
         private Type leviathanType;
         private bool leviathanTried;
         private int iconLoaded;                                                // 只数"真正载入成功"的图标
@@ -679,7 +678,6 @@ namespace SNMap
                 Creature[] all = UnityEngine.Object.FindObjectsOfType<Creature>();
                 List<Creature> aggr = aggrCache;      // 复用, 不再每次扫描 new 一个 List
                 aggr.Clear();
-                aggrSpecies.Clear();                   // 与 aggr 一一对应的物种名(给图标键/标签用)
                 // v2.7p 诊断: 全流程计数 + 记录最近的一只(用来确认"利维坦到底走到哪一步被丢了")
                 int nActive = 0, nTag = 0, nAI = 0, nWhite = 0, nDist = 0;
                 float bestDsq = float.MaxValue;
@@ -739,7 +737,6 @@ namespace SNMap
                     }
                     nDist++;
                     aggr.Add(c);
-                    aggrSpecies.Add(species);
                 }
                 // v2.7p: 每 ~6 秒打一行全流程计数(150fps 下 900 帧), 直接看出卡在哪一步
                 if (frame - lastCreSummary >= 900)
@@ -753,12 +750,19 @@ namespace SNMap
                 }
                 // v2.7n: 排序加权 —— 有利维坦组件的排最前。
                 // 原来是纯按距离取最近 24 个, 利维坦远处很容易被一群小鱼挤掉名额, 表现就是"利维坦不显示"。
+                // v2.7t: 再加稳定性 —— 距离按 1 米分桶、同桶用 instanceID 兜底。
+                // 否则两只位置很近的生物会因距离的微小变化互换槽位, 重叠时上层那只的图标就一直在换。
                 EnsureLeviathanType();
                 aggr.Sort(delegate(Creature a, Creature b)
                 {
-                    float da = (a.transform.position - pp).sqrMagnitude - (IsLeviathan(a) ? 1e9f : 0f);
-                    float db = (b.transform.position - pp).sqrMagnitude - (IsLeviathan(b) ? 1e9f : 0f);
-                    return da.CompareTo(db);
+                    int la = IsLeviathan(a) ? 0 : 1, lb = IsLeviathan(b) ? 0 : 1;
+                    if (la != lb) return la - lb;
+                    int da = Mathf.RoundToInt((a.transform.position - pp).sqrMagnitude);
+                    int db = Mathf.RoundToInt((b.transform.position - pp).sqrMagnitude);
+                    if (da != db) return da.CompareTo(db);
+                    int ia = 0, ib = 0;
+                    try { ia = a.GetInstanceID(); ib = b.GetInstanceID(); } catch (Exception) { }
+                    return ia.CompareTo(ib);
                 });
                 int cn = Mathf.Min(aggr.Count, Proto.MaxCreatures);
                 PutInt(buf, Proto.OffCreatureCount, cn);
@@ -777,9 +781,14 @@ namespace SNMap
                     if (nb.Length > 32) Array.Resize(ref nb, 32);
                     PutInt(creatureRec, off + 8, nb.Length);
                     PutBytes(creatureRec, off + 12, nb);
-                    // 图标键 = 物种名(对应内置的 icons/<key>.png), 大地图窗口拿它画生物头像
-                    // v2.7q: 用扫描时判定好的物种名(利维坦没有 TechTag, 靠 GameObject 名字反查得到)
-                    string key = i < aggrSpecies.Count ? aggrSpecies[i] : null;
+                    // 图标键 = 物种名(对应内置的 icons/<key>.png)
+                    // v2.7t 重要修复: 物种名必须在【排序之后】按 aggr[i] 现取。
+                    // 之前是扫描时按"未排序"的顺序存进 aggrSpecies, 而 aggr 之后被 Sort 重排了 ->
+                    // 位置来自 A 生物、图标键却来自 B 生物, 且每次重扫对应关系还会变 ->
+                    // 表现就是"同一个位置上的图标一直在换, 认不出是同一只"(用户报的现象)。
+                    TechTag tgw = aggr[i].GetComponent<TechTag>();
+                    if (tgw == null) { try { tgw = aggr[i].GetComponentInChildren<TechTag>(true); } catch (Exception) { } }
+                    string key = SpeciesOf(aggr[i], tgw);
                     byte[] kb = string.IsNullOrEmpty(key) ? new byte[0] : Encoding.UTF8.GetBytes(key);
                     if (kb.Length > 32) Array.Resize(ref kb, 32);
                     PutInt(creatureRec, off + 44, kb.Length);
