@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.7v";  // 模块版本: v=审查修复(身份绑定排序/1米分桶改开方/倒序画/计数与keyLen兜底/真时间节流)
+        public const string Version = "2.7w";  // 模块版本: w=审查修复(扫描室空数组重扫/全部节流改真实时间/OnDestroy 清理/诊断串只在打日志那帧拼)
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -218,7 +218,20 @@ namespace SNMap
         private int pingsCacheFrame = -100000;                 // 小地图每帧都要 ping 列表 -> 0.2 秒缓存一次
         private readonly List<Creature> aggrCache = new List<Creature>();
         private MapRoomFunctionality[] roomsCache;
-        private int roomsCacheFrame = -100000;                 // 扫描室很少变, 10 秒重扫一次
+        private float roomsCacheTime = -1000f;                 // 扫描室列表 10 秒重扫一次(按真实时间)
+        // v2.7w: 所有节流改成"真实时间"。原来全是 frame 取模 —— 实测本机游戏跑 ~150fps,
+        // 于是 frame%3 变成 50Hz 写盘(不是 20Hz)、frame%30 变成 5Hz、frame%6 变成 25Hz,
+        // 全部以 2.5~7.5 倍速在跑, 两个进程合计约 1MB/s、200 次文件操作/s。
+        private float tWrite, tSettings, tBeacon, tPingCache, tCreSum;
+        private bool pingsValid;
+
+        private static bool Every(ref float next, float interval)
+        {
+            float now = Time.realtimeSinceStartup;
+            if (now < next) return false;
+            next = now + interval;
+            return true;
+        }
         private MethodInfo roomNodesM;                         // MapRoomFunctionality.GetNodes()
         private bool roomNodesTried;
         // 自检: 每 5 秒把各段耗时打到 SNMap.log(v2.7m 起)
@@ -230,7 +243,7 @@ namespace SNMap
         private bool leviathanTried;
         private int iconLoaded;                                                // 只数"真正载入成功"的图标
         private int lastCreSummary = -100000;                                  // 生物扫描全流程计数日志的节流
-        private int lastMiniDrawLog = -100000;                                 // 小地图生物绘制计数日志的节流
+        private float lastMiniDrawLog = -100000f;                              // 小地图生物绘制计数日志的节流(真实时间)
         // v2.7u: 信标/扫描室物品点与群系文本的持久缓存。
         // WriteState 每次都 Array.Clear, 而这两块只在每 30 帧(≈2Hz)重算一次 ->
         // 中间 8~9 次写盘是"计数 0、整区为 0", 窗口 30Hz 采样大部分看到 0 条 =
@@ -308,7 +321,7 @@ namespace SNMap
         {
             // v2.7m: 原来每帧都 File.Exists + GetLastWriteTimeUtc(每秒 120 次文件系统调用),
             // 改成 ~10Hz 检查一次, 设置窗口的响应速度感觉不出差别。
-            if (frame % 6 != 0) return lastSettingsWrite;
+            if (!Every(ref tSettings, 0.1f)) return lastSettingsWrite;   // 10Hz(真实时间)
             try
             {
                 string p = SettingsPath();
@@ -435,9 +448,35 @@ namespace SNMap
             }
         }
 
+        // v2.7w: 热重载清理。Boot.InstallMain 每次注入都是 Destroy(旧物体) + new GameObject,
+        // 而 Destroy(GameObject) 不会销毁组件 new 出来的 Texture2D, 也不会 Dispose 文件句柄 ——
+        // 实测每次重注入泄漏 图层 3072²(37.7MB) + ringTex + 图标缓存 + stateFs,
+        // 注入三四次就是 150~200MB(交接文档里"这台机器内存不稳定"很可能就是它)。
+        private void OnDestroy()
+        {
+            try
+            {
+                if (stateFs != null) { stateFs.Dispose(); stateFs = null; }
+            }
+            catch (Exception) { }
+            try { ReleaseOtherTextures(null); } catch (Exception) { }      // 传 null => 清空全部图层纹理
+            for (int i = 0; i < layers.Count; i++) layers[i].Tex = null;
+            try
+            {
+                foreach (KeyValuePair<string, Texture2D> kv in iconCache)
+                    if (kv.Value != null) UnityEngine.Object.Destroy(kv.Value);
+            }
+            catch (Exception) { }
+            iconCache.Clear();
+            iconLoaded = 0;
+            if (ringTex != null) { UnityEngine.Object.Destroy(ringTex); ringTex = null; }
+            if (whiteTex != null) { UnityEngine.Object.Destroy(whiteTex); whiteTex = null; }
+            if (dotTex != null) { UnityEngine.Object.Destroy(dotTex); dotTex = null; }
+        }
+
         private void WriteState()
         {
-            if (frame % 3 != 0) return; // 20Hz
+            if (!Every(ref tWrite, 0.05f)) return; // 20Hz(真实时间; 原来 frame%3 在 150fps 下是 50Hz)
             float tStart = Time.realtimeSinceStartup;
             try
             {
@@ -467,7 +506,7 @@ namespace SNMap
                 }
                 PutInt(buf, Proto.OffPlayerValid, valid);
 
-                if (valid == 1 && frame % 30 == 0)
+                if (valid == 1 && Every(ref tBeacon, 0.5f))   // 2Hz(真实时间)
                 {
                     string biome = null;
                     try { biome = Proto.BiomeCnOrNull(pl.GetBiomeString()); } catch (Exception) { }
@@ -565,7 +604,8 @@ namespace SNMap
                 if (perfFrames >= 100)
                 {
                     Cfg.Log("perf: state=" + perfStateMs.ToString("F1") + "ms(含写信标/生物) beacon=" +
-                            perfBeaconMs.ToString("F1") + "ms draw=" + perfDrawMs.ToString("F1") + "ms");
+                            perfBeaconMs.ToString("F1") + "ms creature=" + perfCreatureMs.ToString("F1") +
+                            "ms draw=" + perfDrawMs.ToString("F1") + "ms");
                     perfStateMs = 0f; perfBeaconMs = 0f; perfCreatureMs = 0f; perfDrawMs = 0f; perfFrames = 0;
                 }
             }
@@ -776,9 +816,9 @@ namespace SNMap
                     aggr.Add(c);
                 }
                 // v2.7p: 每 ~6 秒打一行全流程计数(150fps 下 900 帧), 直接看出卡在哪一步
-                if (frame - lastCreSummary >= 900)
+                if (Time.realtimeSinceStartup - tCreSum >= 6f)   // 6 秒一行(真实时间)
                 {
-                    lastCreSummary = frame;
+                    tCreSum = Time.realtimeSinceStartup;
                     Cfg.Log("creature scan: 全部=" + all.Length + " 激活=" + nActive + " 有Tag=" + nTag +
                             " 白名单内=" + nWhite + " 有AI=" + nAI + " 距离内=" + nDist +
                             " 采用=" + aggr.Count + " show=" + showCreatures +
@@ -1004,8 +1044,11 @@ namespace SNMap
             {
                 // v2.7m: 扫描室很少变(而且 FindObjectsOfType 每次都要遍历场景对象), 10 秒重扫一次;
                 // 数组里全是已销毁对象的假 null 时立刻重扫。
-                bool needRescan = roomsCache == null || frame - roomsCacheFrame > 600;
-                if (!needRescan)
+                // v2.7w: 扫描室"全是假 null 就立刻重扫"的那个检查, 在数组长度为 0 时 any 永远是 false
+                // -> needRescan 恒真 -> 每次 CollectScannerNodes 都做一次全场景 FindObjectsOfType。
+                // 现场日志里"场景里没找到扫描室"每 0.2 秒一条 + beacon=8~11ms 就是这个(本机 beaconCount=0)。
+                bool needRescan = roomsCache == null || Time.realtimeSinceStartup - roomsCacheTime > 10f;
+                if (!needRescan && roomsCache.Length > 0)
                 {
                     bool any = false;
                     for (int i = 0; i < roomsCache.Length; i++) { if (roomsCache[i] != null) { any = true; break; } }
@@ -1014,7 +1057,7 @@ namespace SNMap
                 if (needRescan)
                 {
                     roomsCache = UnityEngine.Object.FindObjectsOfType<MapRoomFunctionality>();
-                    roomsCacheFrame = frame;
+                    roomsCacheTime = Time.realtimeSinceStartup;
                 }
                 MapRoomFunctionality[] rooms = roomsCache;
                 if (rooms == null || rooms.Length == 0)
@@ -1793,28 +1836,31 @@ namespace SNMap
 
             // v2.7v: 倒序画 —— 排序把"利维坦/最近"放在小下标, 而 IMGUI 是后画者覆盖前面的,
             // 正序画的话重叠处最上面反而是排名最后的小鱼(利维坦被盖住 = "就在眼前却不显示")。
+            // v2.7w: 调试串只在"真的要打日志的那一帧"拼 —— 原来每帧每只生物都拼一次,
+            // 实测每秒 2250~3000 个小对象(纯为了一条 4 秒才用一次的日志)。
+            bool wantDbg = Time.realtimeSinceStartup - lastMiniDrawLog > 4f;
             int mmDraw = 0;
-            string mmDbg = "";
+            string mmDbg = wantDbg ? "" : null;
             for (int i = trackedCreatures.Count - 1; i >= 0; i--)
             {
                 Creature c = trackedCreatures[i];
-                if (c == null) { if (mmDbg.Length < 140) mmDbg += "[空引用]"; continue; }
+                if (c == null) { if (mmDbg != null && mmDbg.Length < 140) mmDbg += "[空引用]"; continue; }
                 Vector3 q = c.transform.position;
                 if (q.x < winX0 || q.x > winX0 + spanWorld || q.z < winZ0 || q.z > winZ0 + spanWorld)
                 {
-                    if (mmDbg.Length < 140) mmDbg += "[窗外]";
+                    if (mmDbg != null && mmDbg.Length < 140) mmDbg += "[窗外]";
                     continue;
                 }
                 float mx = Mathf.Round(sq.x + (q.x - winX0) / spanWorld * D);
                 float my = Mathf.Round(sq.y + (1f - (q.z - winZ0) / spanWorld) * D);
                 if (Vector2.Distance(new Vector2(mx, my), sq.center) > D * 0.5f - 12f)
                 {
-                    if (mmDbg.Length < 140) mmDbg += "[" + (int)mx + "," + (int)my + "圆外r" + Mathf.RoundToInt(Vector2.Distance(new Vector2(mx, my), sq.center)) + "]";
+                    if (mmDbg != null && mmDbg.Length < 140) mmDbg += "[" + (int)mx + "," + (int)my + "圆外r" + Mathf.RoundToInt(Vector2.Distance(new Vector2(mx, my), sq.center)) + "]";
                     continue;
                 }
                 Texture2D cico = GetIconTex(i < trackedKeys.Count ? trackedKeys[i] : null);
                 mmDraw++;
-                if (mmDbg.Length < 140) mmDbg += "[" + (int)mx + "," + (int)my + (cico != null ? "有图" : "无图") + "]";
+                if (mmDbg != null && mmDbg.Length < 140) mmDbg += "[" + (int)mx + "," + (int)my + (cico != null ? "有图" : "无图") + "]";
                 if (cico != null)
                 {
                     GUI.color = Color.white;
@@ -1826,9 +1872,9 @@ namespace SNMap
                 }
             }
             // v2.7r: 绘制侧计数(最多 ~4 秒一行), 用来定位"某只生物没画出来"是没收到/在窗外/被圆裁掉/没图标
-            if (frame - lastMiniDrawLog > 240)
+            if (Time.realtimeSinceStartup - lastMiniDrawLog > 4f)
             {
-                lastMiniDrawLog = frame;
+                lastMiniDrawLog = Time.realtimeSinceStartup;
                 Cfg.Log("minimap creature: 追踪=" + trackedCreatures.Count + " 画=" + mmDraw +
                         " 档=" + Mathf.RoundToInt(spanWorld) + "m D=" + Mathf.RoundToInt(D) + " " + mmDbg);
             }
@@ -1899,8 +1945,11 @@ namespace SNMap
         // 遍历字典 + new List; ping(信标)位置基本不动, 缓存完全看不出来。
         private List<PingInstance> GetPings()
         {
-            if (frame - pingsCacheFrame < 12 && pingsCache.Count > 0) return pingsCache;
-            pingsCacheFrame = frame;
+            // v2.7w: 去掉 "&& pingsCache.Count > 0" —— 那让"没有信标时缓存完全失效",
+            // 每帧一次静态字段反射 + 字典枚举器装箱(实测 150 次/s)。填充过就复用。
+            if (pingsValid && Time.realtimeSinceStartup - tPingCache < 0.2f) return pingsCache;
+            tPingCache = Time.realtimeSinceStartup;
+            pingsValid = true;
             pingsCache.Clear();
             try
             {

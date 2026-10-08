@@ -1157,6 +1157,26 @@ public class MapForm : Form
     private int iconLoaded;                                   // v2.7n: 只数真正载入成功的
     private int lastCreatureDrawLog;                          // v2.7r: 绘制侧计数日志的节流
 
+    // v2.7w: 把图标缩到小尺寸再缓存/描边(见 GetIcon 的说明)
+    private static Image DownscaleIcon(Image src, int maxSide)
+    {
+        if (src == null) return null;
+        int w = src.Width, h = src.Height;
+        if (w <= maxSide && h <= maxSide) return src;
+        float k = (float)maxSide / Math.Max(w, h);
+        int nw = Math.Max(1, (int)Math.Round(w * k)), nh = Math.Max(1, (int)Math.Round(h * k));
+        Bitmap bmp = new Bitmap(nw, nh, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        using (Graphics g = Graphics.FromImage(bmp))
+        {
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+            g.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+            g.DrawImage(src, new Rectangle(0, 0, nw, nh));
+        }
+        src.Dispose();
+        return bmp;
+    }
+
     private Image GetIcon(string key)
     {
         if (string.IsNullOrEmpty(key)) return null;
@@ -1164,7 +1184,7 @@ public class MapForm : Form
         if (iconCache.TryGetValue(key, out img)) return img;
         // v2.7n: 上限只数"成功载入"的。原来数字典条目数, 而缺图也会存 null 进字典,
         // 扫描室物品/信号点的一堆缺图 key 会把名额占满 -> 后面真正的生物头像载不进来("部分生物加载不出来")
-        if (iconLoaded >= 256) return null;
+        if (iconLoaded >= 520) return null;   // v2.7w: 图标一共 475 张, 上限只数"载入成功"的, 提到 520 让它们都能进来
         try
         {
             string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, Path.Combine("icons", key + ".png"));
@@ -1172,7 +1192,11 @@ public class MapForm : Form
             {
                 // 读进内存再解码: Image.FromFile 会锁住文件(之前更新图标时被锁过)
                 byte[] raw = File.ReadAllBytes(p);
-                img = Image.FromStream(new MemoryStream(raw));
+                // v2.7w: 缩到 ≤64px 再缓存。原图最大 256x128, 而绘制只有 20~24px;
+                // 描边(GetOutline)也按原尺寸生成 Bitmap -> 每图 128KB + 描边 128KB。
+                // 而 DrawIconOutlined 每图标 9 次 DrawImage, GDI+ 每次现场做 256x128→24x24 缩放:
+                // 屏幕上 20 个图标 x 30 次重绘 ≈ 5400 次带缩放的 DrawImage/s, 是窗口侧最大绘制开销。
+                img = DownscaleIcon(Image.FromStream(new MemoryStream(raw)), 64);
             }
             else img = null;
         }
@@ -1203,7 +1227,7 @@ public class MapForm : Form
         if (src == null) return null;
         Image o;
         if (outlineCache.TryGetValue(src, out o)) return o;
-        if (outlineCache.Count >= 256) return null;
+        if (outlineCache.Count >= 600) return null;   // v2.7w: 256 太小(生物+物品+信标键很容易超), 超了后面全没描边
         try
         {
             Bitmap bmp = new Bitmap(src.Width, src.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
