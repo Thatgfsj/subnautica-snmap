@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.7u";  // 模块版本: u=审查修复(信标区持久化/F9翻转基准/写失败日志/设置读一遍)
+        public const string Version = "2.7v";  // 模块版本: v=审查修复(身份绑定排序/1米分桶改开方/倒序画/计数与keyLen兜底/真时间节流)
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -489,12 +489,21 @@ namespace SNMap
                 if (biomeLenCache > 0 && biomeCache != null) PutBytes(buf, Proto.OffBiome, biomeCache);
                 PutInt(buf, Proto.OffBeaconCount, beaconCountCache);
                 Buffer.BlockCopy(beaconRec, 0, buf, Proto.OffBeacons, beaconRec.Length);
-                PutInt(buf, Proto.OffCreatureCount, creatureCount);
-                // 位置每帧实时刷新(生物引用是 1 秒前扫出来的集合, 但坐标必须跟手, 否则标记会一顿一顿地跳)
-                for (int i = 0; i < trackedCreatures.Count; i++)
+                // v2.7v: 数量以"实际有效引用数"为准 —— 扫描中途抛异常时 creatureCount 可能大于列表长度,
+                // 那样窗口会去读没写过的槽位(陈旧坐标 + 陈旧图标键)。
+                int ccOut = Mathf.Min(creatureCount, trackedCreatures.Count);
+                PutInt(buf, Proto.OffCreatureCount, ccOut);
+                // 位置每帧实时刷新(生物引用是几秒前扫出来的集合, 但坐标必须跟手, 否则标记会一顿一顿地跳)
+                for (int i = 0; i < ccOut; i++)
                 {
                     Creature c = trackedCreatures[i];
-                    if (c == null) continue;
+                    if (c == null)
+                    {
+                        // 被销毁/失活: 把该槽标记为无效, 否则窗口会一直画它上一帧的坐标 = 钉在原地的幽灵标记
+                        PutInt(creatureRec, i * 80 + 8, 0);
+                        PutInt(creatureRec, i * 80 + 44, 0);
+                        continue;
+                    }
                     Vector3 cq = c.transform.position;
                     PutFloat(creatureRec, i * 80, Q(cq.x));
                     PutFloat(creatureRec, i * 80 + 4, Q(cq.z));
@@ -694,8 +703,12 @@ namespace SNMap
             // v2.7o: 40 -> 36: 和 WriteBeacons 的 30 帧节流取最小公倍数, 实际是每 180 帧(60fps 下 3 秒)
             // 重扫一次"有哪些生物"。FindObjectsOfType<Creature>() 要把场景对象走一遍(实测 5ms 级别),
             // 坐标仍然是每帧实时取的, 所以显示照样跟手, 只是新进入范围的生物晚最多 3 秒出现。
-            if (frame % 36 != 0 && lastCreatureFrame != 0 && frame - lastCreatureFrame < 36) return;
-            lastCreatureFrame = frame;
+            // v2.7v: 改成"按真实时间"节流。
+            // 原来用 frame 取模 + WriteBeacons 只在 frame%30==0 调用, 两个条件相乘的结果是
+            // 每 60 帧扫一次(60fps 下 1 秒) —— 比注释里写的 3 秒快 3 倍, FindObjectsOfType 的
+            // 5ms 级开销也跟着多花 3 倍; 帧率一变(150fps)实际间隔还会变。用真实时间最直观。
+            if (Time.realtimeSinceStartup - lastCreatureTime < 3f) return;
+            lastCreatureTime = Time.realtimeSinceStartup;
             float tCre = Time.realtimeSinceStartup;
             try
             {
@@ -772,53 +785,66 @@ namespace SNMap
                             " 清单=" + (creatureShow == null ? "null" : creatureShow.Count.ToString()) +
                             " 最近=" + bestDesc);
                 }
-                // v2.7n: 排序加权 —— 有利维坦组件的排最前。
-                // 原来是纯按距离取最近 24 个, 利维坦远处很容易被一群小鱼挤掉名额, 表现就是"利维坦不显示"。
-                // v2.7t: 再加稳定性 —— 距离按 1 米分桶、同桶用 instanceID 兜底。
-                // 否则两只位置很近的生物会因距离的微小变化互换槽位, 重叠时上层那只的图标就一直在换。
+                // v2.7v: 排序改成"带身份的小结构"。
+                // 之前 aggr.Sort() 只重排了 aggr, 而物种名存在另一个并行列表里 -> 位置与图标键错配
+                // (用户报的"位置不变、图标一直在换")。结构体把 身份+排序键 绑在一起, 排序物理上不可能再拆散。
+                // 另外两个修正:
+                //   ① 分桶必须作用在"距离"上 —— 原来对 sqrMagnitude 取整, 50m 处桶宽只有 0.01m, 等于没分桶;
+                //   ② 利维坦/距离/instanceID 的键一次性算好, 比较器里不再做 GetComponent(一轮上千次 native 调用)。
                 EnsureLeviathanType();
-                aggr.Sort(delegate(Creature a, Creature b)
+                crePending.Clear();
+                for (int i = 0; i < aggr.Count; i++)
                 {
-                    int la = IsLeviathan(a) ? 0 : 1, lb = IsLeviathan(b) ? 0 : 1;
-                    if (la != lb) return la - lb;
-                    int da = Mathf.RoundToInt((a.transform.position - pp).sqrMagnitude);
-                    int db = Mathf.RoundToInt((b.transform.position - pp).sqrMagnitude);
-                    if (da != db) return da.CompareTo(db);
-                    int ia = 0, ib = 0;
-                    try { ia = a.GetInstanceID(); ib = b.GetInstanceID(); } catch (Exception) { }
-                    return ia.CompareTo(ib);
+                    Creature c = aggr[i];
+                    CreEntry e;
+                    e.c = c;
+                    e.lev = IsLeviathan(c) ? 0 : 1;
+                    e.bucket = Mathf.RoundToInt(Mathf.Sqrt((c.transform.position - pp).sqrMagnitude));
+                    e.id = 0;
+                    try { e.id = c.GetInstanceID(); } catch (Exception) { }
+                    crePending.Add(e);
+                }
+                crePending.Sort(delegate(CreEntry a, CreEntry b)
+                {
+                    if (a.lev != b.lev) return a.lev - b.lev;
+                    if (a.bucket != b.bucket) return a.bucket.CompareTo(b.bucket);
+                    return a.id.CompareTo(b.id);
                 });
-                int cn = Mathf.Min(aggr.Count, Proto.MaxCreatures);
+                int cn = Mathf.Min(crePending.Count, Proto.MaxCreatures);
                 PutInt(buf, Proto.OffCreatureCount, cn);
                 creatureCount = cn;
                 trackedCreatures.Clear();
                 trackedKeys.Clear();
-                for (int i = 0; i < Proto.MaxCreatures; i++) PutInt(creatureRec, i * 80 + 8, 0);   // 先清旧的标签长度
+                // 清 labelLen 的同时把 keyLen 也清掉: 只清一半时, 万一循环中途抛异常,
+                // 没写到的槽位会留着上一轮别的生物的 key -> 又变成"位置A配图标B"
+                for (int i = 0; i < Proto.MaxCreatures; i++)
+                {
+                    PutInt(creatureRec, i * 80 + 8, 0);
+                    PutInt(creatureRec, i * 80 + 44, 0);
+                }
                 for (int i = 0; i < cn; i++)
                 {
-                    Vector3 q = aggr[i].transform.position;
+                    Vector3 q = crePending[i].c.transform.position;
                     int off = i * 80;
                     PutFloat(creatureRec, off, Q(q.x));
                     PutFloat(creatureRec, off + 4, Q(q.z));
-                    string nm = CreatureName(aggr[i]);
+                    Creature cw = crePending[i].c;
+                    string nm = CreatureName(cw);
                     byte[] nb = string.IsNullOrEmpty(nm) ? new byte[0] : Encoding.UTF8.GetBytes(nm);
                     if (nb.Length > 32) Array.Resize(ref nb, 32);
                     PutInt(creatureRec, off + 8, nb.Length);
                     PutBytes(creatureRec, off + 12, nb);
-                    // 图标键 = 物种名(对应内置的 icons/<key>.png)
-                    // v2.7t 重要修复: 物种名必须在【排序之后】按 aggr[i] 现取。
-                    // 之前是扫描时按"未排序"的顺序存进 aggrSpecies, 而 aggr 之后被 Sort 重排了 ->
-                    // 位置来自 A 生物、图标键却来自 B 生物, 且每次重扫对应关系还会变 ->
-                    // 表现就是"同一个位置上的图标一直在换, 认不出是同一只"(用户报的现象)。
-                    TechTag tgw = aggr[i].GetComponent<TechTag>();
-                    if (tgw == null) { try { tgw = aggr[i].GetComponentInChildren<TechTag>(true); } catch (Exception) { } }
-                    string key = SpeciesOf(aggr[i], tgw);
+                    // 图标键 = 物种名(对应内置的 icons/<key>.png), 取自身份结构里的那只生物
+                    // (v2.7t 的教训: 物种名必须与"位置来自同一只生物", 结构体排序从根上保证了这点)
+                    TechTag tgw = cw.GetComponent<TechTag>();
+                    if (tgw == null) { try { tgw = cw.GetComponentInChildren<TechTag>(true); } catch (Exception) { } }
+                    string key = SpeciesOf(cw, tgw);
                     byte[] kb = string.IsNullOrEmpty(key) ? new byte[0] : Encoding.UTF8.GetBytes(key);
                     if (kb.Length > 32) Array.Resize(ref kb, 32);
                     PutInt(creatureRec, off + 44, kb.Length);
                     PutBytes(creatureRec, off + 48, kb);
                     // 小地图/大地图绘制用: 保留生物引用, 位置每帧实时取(见 WriteState 里的刷新)
-                    trackedCreatures.Add(aggr[i]);
+                    trackedCreatures.Add(cw);
                     trackedKeys.Add(key);
                 }
                 float dc = (Time.realtimeSinceStartup - tCre) * 1000f;
@@ -833,7 +859,17 @@ namespace SNMap
         }
 
         private int creatureCount;
-        private int lastCreatureFrame;
+        // v2.7v: 排序用的身份结构。把"生物引用"和"排序键"绑在一起, 排序不会再把身份与数据拆散
+        // (曾经 aggr 被 Sort 重排、并行列表 aggrSpecies 没跟着排 -> 位置来自 A、图标来自 B)。
+        private struct CreEntry
+        {
+            public Creature c;
+            public int lev;      // 0=利维坦(排最前)
+            public int bucket;   // 距离(米, 已开方)取整 -> 桶宽真的是 1 米
+            public int id;       // instanceID 兜底, 保证同桶内顺序稳定
+        }
+        private readonly List<CreEntry> crePending = new List<CreEntry>();
+        private float lastCreatureTime = -100f;   // 按"真实时间"节流, 不受帧率影响
         // 上一次扫描到的生物记录 + 给绘制用的生物引用。
         // 状态文件每帧都会 Array.Clear, 而"有哪些生物"只在每 60 帧(≈1秒)扫一次 ->
         // 记录要持久保存每帧原样写回; 而且位置必须每帧从 transform 实时取,
@@ -845,27 +881,42 @@ namespace SNMap
         // 按设置窗口的勾选判断某物种是否显示:
         //   CreatureShow 键存在 -> 只显示列表里的(空 = 一个都不显示); "*" = 全部显示
         //   没有该键 -> 回落到 config.ini 的 CreatureWhitelist(空=全部)
-        // v2.7q: 判定"这是什么物种"。
+        // v2.7q/v2.7v: 判定"这是什么物种"。
         // 实测: 死神利维坦根对象与子物体上都没有可用的 TechTag(诊断行 有Tag=0) -> 白名单拿不到名字
-        // -> 整只被静默丢掉, 表现就是"利维坦就在眼前却不显示"。改成三级兜底:
-        //   1) TechTag(含未激活子物体)  2) GameObject 名字反查 TechType 枚举(大小写不敏感, 名字通常就是 TechType 名)
-        //   3) 去掉 (Clone) 的原名
+        // -> 整只被静默丢掉, 表现就是"利维坦就在眼前却不显示"。三级兜底:
+        //   1) TechTag(含未激活子物体)
+        //   2) GameObject 名字反查 TechType 枚举(大小写不敏感; 名字通常就是 TechType 名)
+        //      v2.7v: 反复剥掉 Unity 后缀 —— "(Clone)"、" (1)"、"(2)" 等, 否则第二只同类会认不出来
+        //   3) 剥不出枚举时返回剥干净的原名(调用方会照原样比较/找不到图标, 至少日志里看得见)
         private string SpeciesOf(Creature c, TechTag tg)
         {
             if (tg != null) return tg.type.ToString();
             string n = null;
             try { n = c.gameObject.name; } catch (Exception) { }
             if (string.IsNullOrEmpty(n)) return null;
-            int p = n.IndexOf("(Clone)");
-            if (p >= 0) n = n.Substring(0, p);
-            n = n.Trim();
+            string t = n.Trim();
+            for (int guard = 0; guard < 4; guard++)
+            {
+                if (t.Length < 3 || t[t.Length - 1] != ')') break;
+                int p = t.LastIndexOf('(');
+                if (p <= 0) break;
+                string inner = t.Substring(p + 1, t.Length - p - 2).Trim();
+                bool ok = inner == "Clone";
+                if (!ok && inner.Length > 0)
+                {
+                    ok = true;
+                    for (int k = 0; k < inner.Length; k++) { if (!char.IsDigit(inner[k])) { ok = false; break; } }
+                }
+                if (!ok) break;
+                t = t.Substring(0, p).Trim();
+            }
             try
             {
                 TechType tt;
-                if (Enum.TryParse<TechType>(n, true, out tt)) return tt.ToString();
+                if (Enum.TryParse<TechType>(t, true, out tt)) return tt.ToString();
             }
             catch (Exception) { }
-            return n;
+            return t;
         }
 
         // 按设置窗口的勾选判断某物种是否显示(参数是上面 SpeciesOf 得到的物种名):
@@ -941,11 +992,13 @@ namespace SNMap
 
         private void CollectScannerNodes(Vector3 pp)
         {
+            // v2.7v: 节流判断必须在 Clear 之前 —— 原来先清空三个并行列表再 return,
+            // 只要哪天信标侧的调用节奏变了(不再恰好是 30 的倍数), 扫描室物品点就会 100% 消失。
+            if (frame % 30 != 0 && lastScannerFrame != 0 && frame - lastScannerFrame < 30) return;
+            lastScannerFrame = frame;
             scanNodePos.Clear();
             scanNodeKey.Clear();
             scanNodeName.Clear();
-            if (frame % 30 != 0 && lastScannerFrame != 0 && frame - lastScannerFrame < 30) return;
-            lastScannerFrame = frame;
             scanRawTotal = 0;                     // v2.7m: 这个计数以前从不清零, 日志里的数字一直累加, 没法看
             try
             {
@@ -1738,10 +1791,11 @@ namespace SNMap
                 }
             }
 
-            // 敌对生物: 小地图也画(有内置头像就画头像, 没有画黑描边红感叹号); 坐标每帧实时取
+            // v2.7v: 倒序画 —— 排序把"利维坦/最近"放在小下标, 而 IMGUI 是后画者覆盖前面的,
+            // 正序画的话重叠处最上面反而是排名最后的小鱼(利维坦被盖住 = "就在眼前却不显示")。
             int mmDraw = 0;
             string mmDbg = "";
-            for (int i = 0; i < trackedCreatures.Count; i++)
+            for (int i = trackedCreatures.Count - 1; i >= 0; i--)
             {
                 Creature c = trackedCreatures[i];
                 if (c == null) { if (mmDbg.Length < 140) mmDbg += "[空引用]"; continue; }

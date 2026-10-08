@@ -1065,8 +1065,11 @@ public class MapForm : Form
             {
                 int cTotal = creatureWin.Count, cInView = 0, cIcon = 0;
                 string cDbg = "";
-                foreach (CreaturePt c in creatureWin)
+                // v2.7v: 倒序画 —— 状态文件里排在前面的(利维坦/最近)应该压在最上层,
+                // 正序画的话重叠处最上面是排名最后的小鱼, 利维坦会被盖住。
+                for (int ci = creatureWin.Count - 1; ci >= 0; ci--)
                 {
+                    CreaturePt c = creatureWin[ci];
                     PointF cp = WorldToScreen(L, c.X, c.Z);
                     if (cp.X < r.X - 20f || cp.Y < r.Y - 20f || cp.X > r.Right + 20f || cp.Y > r.Bottom + 20f)
                     {
