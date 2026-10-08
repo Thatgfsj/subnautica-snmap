@@ -147,12 +147,31 @@ namespace SNMap
             }
         }
 
+        private static int logLines;
+
         public static void Log(string msg)
         {
             try
             {
-                File.AppendAllText(Path.Combine(BaseDir, "SNMap.log"),
-                    DateTime.Now.ToString("HH:mm:ss ") + msg + "\r\n");
+                string p = Path.Combine(BaseDir, "SNMap.log");
+                // v2.7y: 日志轮转。实测诊断行合计约 1.5 条/秒 -> 250KB/小时(~6MB/天), 永不清理。
+                // 每 500 行检查一次大小, 超过 512KB 就轮转成 .1(与窗口侧 WinLog 的做法一致)。
+                if (++logLines >= 500)
+                {
+                    logLines = 0;
+                    try
+                    {
+                        FileInfo fi = new FileInfo(p);
+                        if (fi.Exists && fi.Length > 512 * 1024)
+                        {
+                            string bak = p + ".1";
+                            if (File.Exists(bak)) File.Delete(bak);
+                            File.Move(p, bak);
+                        }
+                    }
+                    catch (Exception) { }
+                }
+                File.AppendAllText(p, DateTime.Now.ToString("HH:mm:ss ") + msg + "\r\n");
             }
             catch (Exception) { }
             try { Debug.Log("[SNMap] " + msg); } catch (Exception) { }
