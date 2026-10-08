@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.7d";  // 模块版本: 日志 + 状态文件(窗口显示"模块vX.X"); d=带一次性图标导出
+        public const string Version = "2.7m";  // 模块版本: 日志 + 状态文件; m=性能优化(注入后卡顿)
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -203,9 +203,27 @@ namespace SNMap
         private byte[] modVerBytes;                          // 版本串字节(避免每次写状态都分配)
         private string biomeCnCache;                         // HUD 中文群系(节流, 不必每帧问游戏)
         private int biomeFrame = -1000;
+        private string hudLineCache;                         // HUD 那行文字(10Hz 拼一次)
+        private int hudLineFrame = -1000;
         private readonly Dictionary<string, string> labelToTech = new Dictionary<string, string>();
         private bool labelMapBuilt;
         private readonly Dictionary<string, Texture2D> iconCache = new Dictionary<string, Texture2D>();
+
+        // ---------------- v2.7m 性能相关(注入后卡顿) ----------------
+        private string statePathCache, settingsPathCache;      // 路径缓存: 别再每帧 Path.Combine
+        private FileStream stateFs;                            // 状态文件常开句柄(不再每秒新建 20 个文件)
+        private readonly byte[] speciesBlock = new byte[Proto.MaxSpecies * Proto.SpeciesStride];
+        private int speciesBlockCount = -1;                    // 物种清单没变就不重新编码
+        private readonly List<PingInstance> pingsCache = new List<PingInstance>();
+        private int pingsCacheFrame = -100000;                 // 小地图每帧都要 ping 列表 -> 0.2 秒缓存一次
+        private readonly List<Creature> aggrCache = new List<Creature>();
+        private MapRoomFunctionality[] roomsCache;
+        private int roomsCacheFrame = -100000;                 // 扫描室很少变, 10 秒重扫一次
+        private MethodInfo roomNodesM;                         // MapRoomFunctionality.GetNodes()
+        private bool roomNodesTried;
+        // 自检: 每 5 秒把各段耗时打到 SNMap.log(v2.7m 起)
+        private float perfStateMs, perfBeaconMs, perfCreatureMs, perfDrawMs;
+        private int perfFrames;
 
         private static readonly string[] Headings = new string[]
         {
@@ -273,9 +291,12 @@ namespace SNMap
         // 窗口可实时改小地图大小/生物开关/图层(设置文件)
         private DateTime ReadWindowSettings()
         {
+            // v2.7m: 原来每帧都 File.Exists + GetLastWriteTimeUtc(每秒 120 次文件系统调用),
+            // 改成 ~10Hz 检查一次, 设置窗口的响应速度感觉不出差别。
+            if (frame % 6 != 0) return lastSettingsWrite;
             try
             {
-                string p = Path.Combine(Cfg.BaseDir, Proto.SettingsFileName);
+                string p = SettingsPath();
                 if (!File.Exists(p)) return DateTime.MinValue;
                 DateTime wt = File.GetLastWriteTimeUtc(p);
                 if (wt == lastSettingsWrite) return wt;
@@ -398,6 +419,7 @@ namespace SNMap
         private void WriteState()
         {
             if (frame % 3 != 0) return; // 20Hz
+            float tStart = Time.realtimeSinceStartup;
             try
             {
                 byte[] buf = stateBuf;
@@ -434,7 +456,10 @@ namespace SNMap
                     if (b.Length > 63) Array.Resize(ref b, 63);
                     PutInt(buf, Proto.OffBiomeLen, b.Length);
                     PutBytes(buf, Proto.OffBiome, b);
+                    float tb = Time.realtimeSinceStartup;
                     WriteBeacons(pl, buf);
+                    float db = (Time.realtimeSinceStartup - tb) * 1000f;
+                    if (db > perfBeaconMs) perfBeaconMs = db;
                 }
                 PutInt(buf, Proto.OffCreatureCount, creatureCount);
                 // 位置每帧实时刷新(生物引用是 1 秒前扫出来的集合, 但坐标必须跟手, 否则标记会一顿一顿地跳)
@@ -449,52 +474,59 @@ namespace SNMap
                 Buffer.BlockCopy(creatureRec, 0, buf, Proto.OffCreatures, creatureRec.Length);   // 每帧原样写回
 
                 // 见过的敌对物种清单(设置窗口右侧"全部敌对生物"用), 每次写状态都带上,
-                // 否则 19/20 次写入会在 Array.Clear 之后变成空清单
+                // 否则 19/20 次写入会在 Array.Clear 之后变成空清单。
+                // v2.7m: 以前每写一次(20Hz)就把所有物种名重新 UTF8 编码一遍 = 每秒几百次小对象分配,
+                // 现在只在清单长度变化时编码一次, 之后整块内存拷贝。
                 int sc = Mathf.Min(seenSpecies.Count, Proto.MaxSpecies);
-                PutInt(buf, Proto.OffSpeciesCount, sc);
-                for (int i = 0; i < sc; i++)
+                if (sc != speciesBlockCount)
                 {
-                    byte[] nb = Encoding.UTF8.GetBytes(seenSpecies[i]);
-                    if (nb.Length > Proto.SpeciesStride - 4) Array.Resize(ref nb, Proto.SpeciesStride - 4);
-                    int so = Proto.OffSpecies + i * Proto.SpeciesStride;
-                    PutInt(buf, so, nb.Length);
-                    PutBytes(buf, so + 4, nb);
+                    speciesBlockCount = sc;
+                    Array.Clear(speciesBlock, 0, speciesBlock.Length);
+                    for (int i = 0; i < sc; i++)
+                    {
+                        byte[] nb = Encoding.UTF8.GetBytes(seenSpecies[i]);
+                        if (nb.Length > Proto.SpeciesStride - 4) Array.Resize(ref nb, Proto.SpeciesStride - 4);
+                        int so = i * Proto.SpeciesStride;
+                        PutInt(speciesBlock, so, nb.Length);
+                        PutBytes(speciesBlock, so + 4, nb);
+                    }
+                }
+                PutInt(buf, Proto.OffSpeciesCount, sc);
+                if (sc > 0) Buffer.BlockCopy(speciesBlock, 0, buf, Proto.OffSpecies, sc * Proto.SpeciesStride);
+
+                string sp = StatePath();
+                // v2.7m: 改回"常开句柄 + 定长就地覆写"。
+                // 之前为了避免撕裂读用了"写 .tmp 再 File.Replace", 但那是每秒 20 次
+                // 新建文件 + 原子替换 + Flush —— 在开了实时杀毒/索引的机器上, 每秒 20 个新文件
+                // 会让文件系统过滤驱动反复介入, 表现就是游戏周期性卡顿。
+                // 定长就地覆盖不会截断文件(窗口不会读到 0 字节), 撕裂读最多混进相邻一帧的数据,
+                // 这个已经由"生物记录持久化 + 小地图像素吸附"兜住了。
+                try
+                {
+                    if (stateFs == null)
+                    {
+                        stateFs = new FileStream(sp, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite);
+                        if (stateFs.Length != buf.Length) stateFs.SetLength(buf.Length);
+                    }
+                    stateFs.Position = 0;
+                    stateFs.Write(buf, 0, buf.Length);
+                }
+                catch (Exception)
+                {
+                    // 句柄坏了(文件被删/被独占) -> 丢掉句柄下次重建
+                    try { if (stateFs != null) stateFs.Dispose(); } catch (Exception) { }
+                    stateFs = null;
                 }
 
-                string sp = Path.Combine(Cfg.BaseDir, Proto.StateFileName);
-                string tmp = sp + ".tmp";
-                // 先写临时文件再原子替换: 窗口每 33ms 读一次, 如果原地覆写, 它会读到"写了一半"的内容
-                // (玩家坐标在最前面、生物记录在最后 -> 只有生物在相邻两帧之间来回跳 = 一直抖动)。
-                // 替换要求读的那头以 FileShare.Delete 打开(窗口已配合), 失败则退回就地覆盖保证还能更新。
-                bool wrote = false;
-                for (int attempt = 0; attempt < 3 && !wrote; attempt++)
+                // 自检: 每 5 秒(20Hz 下 100 次)打一行各段最坏耗时, 便于下次直接看数据
+                float dtState = (Time.realtimeSinceStartup - tStart) * 1000f;
+                if (dtState > perfStateMs) perfStateMs = dtState;
+                perfFrames++;
+                if (perfFrames >= 100)
                 {
-                    try
-                    {
-                        using (FileStream fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
-                        {
-                            fs.Write(buf, 0, buf.Length);
-                            fs.Flush();
-                        }
-                        if (File.Exists(sp)) File.Replace(tmp, sp, null);
-                        else File.Move(tmp, sp);
-                        wrote = true;
-                    }
-                    catch (Exception)
-                    {
-                        if (attempt < 2) continue;
-                        try
-                        {
-                            using (FileStream fs = new FileStream(sp, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite))
-                            {
-                                if (fs.Length != buf.Length) fs.SetLength(buf.Length);
-                                fs.Position = 0;
-                                fs.Write(buf, 0, buf.Length);
-                            }
-                            wrote = true;
-                        }
-                        catch (Exception) { }
-                    }
+                    Cfg.Log("perf: state=" + perfStateMs.ToString("F1") + "ms(含写信标/生物) beacon=" +
+                            perfBeaconMs.ToString("F1") + "ms draw=" + perfDrawMs.ToString("F1") + "ms");
+                    perfStateMs = 0f; perfBeaconMs = 0f; perfCreatureMs = 0f; perfDrawMs = 0f; perfFrames = 0;
                 }
             }
             catch (Exception ex)
@@ -508,9 +540,19 @@ namespace SNMap
             b[off] = (byte)v; b[off + 1] = (byte)(v >> 8); b[off + 2] = (byte)(v >> 16); b[off + 3] = (byte)(v >> 24);
         }
 
+        // 免分配地写 float。
+        // BitConverter.GetBytes(float) 每次都会 new 一个 byte[4], 而一次状态写入要写上百个 float
+        // (玩家 4 + 生物最多 48 + 信标/物品点最多 64), 20Hz 下就是每秒两千多个小对象 ->
+        // Unity 的 GC 是 Boehm 不分代、一次全停, 分配一多就变成周期性卡顿。
+        // 这里用 Buffer.BlockCopy(float[]->byte[]) 走原生内存拷贝, 零分配。
+        private static readonly float[] fScratch = new float[1];
+        private static readonly byte[] bScratch = new byte[4];
+
         private static void PutFloat(byte[] b, int off, float v)
         {
-            PutInt(b, off, BitConverter.ToInt32(BitConverter.GetBytes(v), 0));
+            fScratch[0] = v;
+            Buffer.BlockCopy(fScratch, 0, bScratch, 0, 4);
+            b[off] = bScratch[0]; b[off + 1] = bScratch[1]; b[off + 2] = bScratch[2]; b[off + 3] = bScratch[3];
         }
 
         private static void PutLong(byte[] b, int off, long v)
@@ -522,6 +564,19 @@ namespace SNMap
         {
             if (data == null || data.Length == 0) return;
             Buffer.BlockCopy(data, 0, b, off, data.Length);
+        }
+
+        // 路径缓存(WriteState 每秒调用 20 次, Path.Combine 每次都分配字符串)
+        private string StatePath()
+        {
+            if (statePathCache == null) statePathCache = Path.Combine(Cfg.BaseDir, Proto.StateFileName);
+            return statePathCache;
+        }
+
+        private string SettingsPath()
+        {
+            if (settingsPathCache == null) settingsPathCache = Path.Combine(Cfg.BaseDir, Proto.SettingsFileName);
+            return settingsPathCache;
         }
 
         private void WriteBeacons(Player pl, byte[] buf)
@@ -602,12 +657,16 @@ namespace SNMap
                 trackedKeys.Clear();
                 return;
             }
-            if (frame % 20 != 0 && lastCreatureFrame != 0 && frame - lastCreatureFrame < 20) return;
+            // v2.7m: 生物"有哪些"每 2 秒重扫一次就够(坐标是每帧实时取的, 显示依旧跟手),
+            // 原来 ~1 秒一次; FindObjectsOfType<Creature>() 要把场景对象都走一遍, 是这里最大的一笔开销。
+            if (frame % 40 != 0 && lastCreatureFrame != 0 && frame - lastCreatureFrame < 40) return;
             lastCreatureFrame = frame;
+            float tCre = Time.realtimeSinceStartup;
             try
             {
                 Creature[] all = UnityEngine.Object.FindObjectsOfType<Creature>();
-                List<Creature> aggr = new List<Creature>();
+                List<Creature> aggr = aggrCache;      // 复用, 不再每次扫描 new 一个 List
+                aggr.Clear();
                 foreach (Creature c in all)
                 {
                     if (c == null || !c.gameObject.activeInHierarchy) continue;
@@ -656,11 +715,13 @@ namespace SNMap
                     trackedCreatures.Add(aggr[i]);
                     trackedKeys.Add(key);
                 }
+                float dc = (Time.realtimeSinceStartup - tCre) * 1000f;
+                if (dc > perfCreatureMs) perfCreatureMs = dc;
             }
             catch (Exception ex)
             {
-                PutInt(buf, Proto.OffCreatureCount, 0);
-                creatureCount = 0;
+                // v2.7m: 出异常不再把数量清零(那会让地图上的生物整批闪一下);
+                // 保留上一次的结果, 位置刷新照旧, 最多是"集合"晚一点更新。
                 if (frame % 1800 == 0) Cfg.Log("creature scan failed: " + ex.Message);
             }
         }
@@ -708,9 +769,24 @@ namespace SNMap
             scanNodeName.Clear();
             if (frame % 30 != 0 && lastScannerFrame != 0 && frame - lastScannerFrame < 30) return;
             lastScannerFrame = frame;
+            scanRawTotal = 0;                     // v2.7m: 这个计数以前从不清零, 日志里的数字一直累加, 没法看
             try
             {
-                MapRoomFunctionality[] rooms = UnityEngine.Object.FindObjectsOfType<MapRoomFunctionality>();
+                // v2.7m: 扫描室很少变(而且 FindObjectsOfType 每次都要遍历场景对象), 10 秒重扫一次;
+                // 数组里全是已销毁对象的假 null 时立刻重扫。
+                bool needRescan = roomsCache == null || frame - roomsCacheFrame > 600;
+                if (!needRescan)
+                {
+                    bool any = false;
+                    for (int i = 0; i < roomsCache.Length; i++) { if (roomsCache[i] != null) { any = true; break; } }
+                    if (!any) needRescan = true;
+                }
+                if (needRescan)
+                {
+                    roomsCache = UnityEngine.Object.FindObjectsOfType<MapRoomFunctionality>();
+                    roomsCacheFrame = frame;
+                }
+                MapRoomFunctionality[] rooms = roomsCache;
                 if (rooms == null || rooms.Length == 0)
                 {
                     if (frame % 600 == 0) Cfg.Log("scanner: 场景里没找到扫描室");
@@ -739,9 +815,23 @@ namespace SNMap
                             riPosF = riType.GetField("position");
                         }
                     }
-                    Cfg.Log("scanner api: GetNodes(TechType)=" + (getNodesM != null) + " resourceInfo=" + (riType != null));
+                    // v2.7m: 首选扫描室自己的节点表(MapRoomFunctionality.GetNodes()) —— 里面只有
+                    // 它范围内扫到的那些点(几十个); 全局数据库那版要遍历"全世界该类型的所有节点"
+                    // (实测上千个, 每个还要两次反射取值), 是注入后卡顿的主要来源之一。
+                    if (!roomNodesTried)
+                    {
+                        roomNodesTried = true;
+                        try
+                        {
+                            MethodInfo m = typeof(MapRoomFunctionality).GetMethod("GetNodes");
+                            if (m != null && m.GetParameters().Length == 0) roomNodesM = m;
+                        }
+                        catch (Exception) { }
+                    }
+                    Cfg.Log("scanner api: GetNodes(TechType)=" + (getNodesM != null) + " room.GetNodes()=" + (roomNodesM != null) +
+                            " resourceInfo=" + (riType != null));
                 }
-                if (getNodesM == null || riType == null) return;
+                if (riType == null || riPosF == null) return;
 
                 // 每个扫描室只显示它"当前正在扫描的那一个物品"(用户要求):
                 // 一个房间同一时间只扫一种东西, 多个房间各扫各的 -> 逐个房间取它 GetActiveTechType() 对应的节点。
@@ -783,20 +873,37 @@ namespace SNMap
                     if (string.IsNullOrEmpty(cn)) cn = key;
 
                     System.Collections.IEnumerable all = null;
-                    try { all = getNodesM.Invoke(null, new object[] { act }) as System.Collections.IEnumerable; }
-                    catch (Exception ex) { if (scanErrLogged < 3) { scanErrLogged++; Cfg.Log("GetNodes invoke fail: " + ex.Message); } }
+                    // 优先用房间自己的列表(小、已经按房间范围筛过); 拿不到才退回全局数据库
+                    if (roomNodesM != null)
+                    {
+                        try { all = roomNodesM.Invoke(room, null) as System.Collections.IEnumerable; }
+                        catch (Exception) { }
+                    }
+                    if (all == null && getNodesM != null)
+                    {
+                        try { all = getNodesM.Invoke(null, new object[] { act }) as System.Collections.IEnumerable; }
+                        catch (Exception ex) { if (scanErrLogged < 3) { scanErrLogged++; Cfg.Log("GetNodes invoke fail: " + ex.Message); } }
+                    }
                     if (all == null) continue;
 
                     float lim = range + 60f;
+                    bool fromRoom = roomNodesM != null;
                     int taken = 0;
                     foreach (object info in all)
                     {
                         if (info == null || taken >= perRoom || scanNodePos.Count >= 48) break;
                         scanRawTotal++;
-                        TechType nt = (TechType)riTechF.GetValue(info);
-                        if (nt != act) continue;                               // 保险: 只要这个房间正在扫的类型
+                        if (!fromRoom)
+                        {
+                            TechType nt = (TechType)riTechF.GetValue(info);
+                            if (nt != act) continue;                           // 全局库里要挑类型
+                        }
                         Vector3 pos = (Vector3)riPosF.GetValue(info);
-                        if ((pos - rp).sqrMagnitude > lim * lim) continue;      // 超出该房间的扫描范围
+                        if (fromRoom)
+                        {
+                            // 房间的表就是它扫描范围内的点, 但保险起见还是按范围夹一下
+                            if ((pos - rp).sqrMagnitude > lim * lim) continue;
+                        }
                         scanNodePos.Add(pos);
                         scanNodeKey.Add(key);
                         scanNodeName.Add(cn);
@@ -1023,11 +1130,66 @@ namespace SNMap
             try
             {
                 string p = Path.Combine(Cfg.BaseDir, Path.Combine("icons", key + ".png"));
-                t = File.Exists(p) ? LoadTexture(p) : null;
+                t = File.Exists(p) ? LoadIconTexture(p) : null;
             }
             catch (Exception) { t = null; }
             iconCache[key] = t;
             return t;
+        }
+
+        // 图标缩到最长边 ≤64 像素再进显存。
+        // 原始图最大 256x128, 而实际只在 16~24 像素的尺寸上绘制 —— 不缩的话 474 张全载入要几十 MB 显存,
+        // 而且每遇到一个新物种就要上传一张大图(那一下就是一次掉帧)。
+        // 缩放用"按 alpha 加权的盒式平均": 完全透明的像素不参与 RGB 平均, 否则边缘会发黑(之前那个黑边问题的同类坑)。
+        private static Texture2D LoadIconTexture(string path)
+        {
+            Texture2D big = LoadTexture(path);
+            if (big == null) return null;
+            int w = big.width, h = big.height;
+            int max = Mathf.Max(w, h);
+            if (max <= 64) return big;
+            try
+            {
+                float k = 64f / max;
+                int nw = Mathf.Max(1, Mathf.RoundToInt(w * k));
+                int nh = Mathf.Max(1, Mathf.RoundToInt(h * k));
+                Color32[] src = big.GetPixels32();
+                Color32[] dst = new Color32[nw * nh];
+                for (int y = 0; y < nh; y++)
+                {
+                    int y0 = y * h / nh;
+                    int y1 = Mathf.Max(y0 + 1, (y + 1) * h / nh);
+                    for (int x = 0; x < nw; x++)
+                    {
+                        int x0 = x * w / nw;
+                        int x1 = Mathf.Max(x0 + 1, (x + 1) * w / nw);
+                        int r = 0, g = 0, b = 0, a = 0, n = 0;
+                        for (int sy = y0; sy < y1; sy++)
+                        {
+                            int row = sy * w;
+                            for (int sx = x0; sx < x1; sx++)
+                            {
+                                Color32 c = src[row + sx];
+                                if (c.a == 0) continue;      // 透明像素不参与, 避免把边缘拉黑
+                                r += c.r; g += c.g; b += c.b; a += c.a; n++;
+                            }
+                        }
+                        Color32 o = new Color32(0, 0, 0, 0);
+                        if (n != 0)
+                        {
+                            o.r = (byte)(r / n); o.g = (byte)(g / n); o.b = (byte)(b / n); o.a = (byte)(a / n);
+                        }
+                        dst[y * nw + x] = o;
+                    }
+                }
+                Texture2D small = new Texture2D(nw, nh, TextureFormat.RGBA32, false);
+                small.wrapMode = TextureWrapMode.Clamp;
+                small.SetPixels32(dst);
+                small.Apply();
+                UnityEngine.Object.Destroy(big);
+                return small;
+            }
+            catch (Exception) { return big; }
         }
 
         private static string CreatureName(Creature c)
@@ -1048,6 +1210,7 @@ namespace SNMap
             // 只在 Repaint 事件里画: Unity 每帧至少还会发一次 Layout 事件, 不守这一下等于所有绘制都做两遍
             // (小地图是按列切片画的, 300~800 次 DrawTexture 翻倍就是上千次/帧)
             if (Event.current.type != EventType.Repaint) return;
+            float tDraw = Time.realtimeSinceStartup;
 
             Player pl = Player.main;
             if (pl == null || pl.transform == null) return;
@@ -1064,21 +1227,26 @@ namespace SNMap
             }
             string biome = biomeCnCache;
 
-            string dir8 = Heading8();
-            string line;
-            if (uiFontCjk)
+            // v2.7m: HUD 那行文字 10Hz 拼一次就够了 —— string.Format 每帧 1~2 个字符串对象,
+            // 一秒上百个也是白给 GC 的。
+            if (frame - hudLineFrame >= 6)
             {
-                line = biome == null
-                    ? string.Format("X {0:F0}   Z {1:F0}   深度 {2:F0}m   {3}", pos.x, pos.z, depth, dir8)
-                    : string.Format("X {0:F0}   Z {1:F0}   深度 {2:F0}m   {3}   {4}", pos.x, pos.z, depth, dir8, biome);
+                hudLineFrame = frame;
+                string dir8 = Heading8();
+                if (uiFontCjk)
+                {
+                    hudLineCache = biome == null
+                        ? string.Format("X {0:F0}   Z {1:F0}   深度 {2:F0}m   {3}", pos.x, pos.z, depth, dir8)
+                        : string.Format("X {0:F0}   Z {1:F0}   深度 {2:F0}m   {3}   {4}", pos.x, pos.z, depth, dir8, biome);
+                }
+                else
+                {
+                    hudLineCache = biome == null
+                        ? string.Format("X {0:F0}   Z {1:F0}   Depth {2:F0}m   {3}", pos.x, pos.z, depth, dir8)
+                        : string.Format("X {0:F0}   Z {1:F0}   Depth {2:F0}m   {3}   {4}", pos.x, pos.z, depth, dir8, biome);
+                }
             }
-            else
-            {
-                line = biome == null
-                    ? string.Format("X {0:F0}   Z {1:F0}   Depth {2:F0}m   {3}", pos.x, pos.z, depth, dir8)
-                    : string.Format("X {0:F0}   Z {1:F0}   Depth {2:F0}m   {3}   {4}", pos.x, pos.z, depth, dir8, biome);
-            }
-            LabelShadowed(new Rect(16, 12, 1200, 60), line, hudStyle);
+            if (hudLineCache != null) LabelShadowed(new Rect(16, 12, 1200, 60), hudLineCache, hudStyle);
 
             if (minimapIdx > 0 && Cfg.MinimapSpans.Length > 0)
             {
@@ -1092,6 +1260,9 @@ namespace SNMap
                 LabelShadowed(new Rect(16, 48, 400, 22),
                     uiFontCjk ? "小地图: 关  [F7 开启]" : "minimap: off  [F7]", smallStyle);
             }
+
+            float dgl = (Time.realtimeSinceStartup - tDraw) * 1000f;
+            if (dgl > perfDrawMs) perfDrawMs = dgl;
         }
 
         // ------------------------------------------------------------- layers
@@ -1460,22 +1631,26 @@ namespace SNMap
             }
         }
 
+        // v2.7m: 结果缓存 0.2 秒。小地图每帧都要这份列表 —— 以前是每帧一次静态字段反射 +
+        // 遍历字典 + new List; ping(信标)位置基本不动, 缓存完全看不出来。
         private List<PingInstance> GetPings()
         {
+            if (frame - pingsCacheFrame < 12 && pingsCache.Count > 0) return pingsCache;
+            pingsCacheFrame = frame;
+            pingsCache.Clear();
             try
             {
-                if (pingsDictField == null) return null;
+                if (pingsDictField == null) return pingsCache;
                 IDictionary dict = pingsDictField.GetValue(null) as IDictionary;
-                if (dict == null) return null;
-                List<PingInstance> list = new List<PingInstance>();
+                if (dict == null) return pingsCache;
                 foreach (object o in dict.Values)
                 {
                     PingInstance pi = o as PingInstance;
-                    if (pi != null) list.Add(pi);
+                    if (pi != null) pingsCache.Add(pi);
                 }
-                return list;
             }
-            catch (Exception) { return null; }
+            catch (Exception) { }
+            return pingsCache;
         }
 
         private Color[] GetPingColors()
