@@ -86,7 +86,7 @@ namespace SNMap
 
             try
             {
-                string[] lines = File.ReadAllLines(path);
+                string[] lines = Proto.ReadAllLinesShared(path);
                 for (int i = 0; i < lines.Length; i++)
                 {
                     string line = lines[i].Trim();
@@ -332,7 +332,7 @@ namespace SNMap
             try
             {
                 if (!File.Exists(path)) return d;
-                string[] lines = File.ReadAllLines(path);
+                string[] lines = Proto.ReadAllLinesShared(path);
                 for (int i = 0; i < lines.Length; i++)
                 {
                     string line = lines[i].Trim();
@@ -359,7 +359,7 @@ namespace SNMap
             {
                 string p = Path.Combine(Cfg.BaseDir, Proto.SettingsFileName);
                 if (!File.Exists(p)) return null;
-                foreach (string ln in File.ReadAllLines(p))
+                foreach (string ln in Proto.ReadAllLinesShared(p))
                 {
                     string line = ln.Trim();
                     if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
@@ -374,16 +374,25 @@ namespace SNMap
 
         private void WriteSettingsKey(string key, string val)
         {
-            try
+            // 读-改-写整个文件, 而窗口也在写同一个文件(而且两边都是读-改-写):
+            // 用"先写 .tmp 再原子替换" + 写完回读校验, 键丢了就重试,
+            // 否则一次撞车就会把对方的键抹掉(实测: ShowCreatures 被抹掉后设置窗口里怎么点都不生效)。
+            for (int attempt = 0; attempt < 4; attempt++)
             {
-                string p = Path.Combine(Cfg.BaseDir, Proto.SettingsFileName);
-                Dictionary<string, string> d = ReadSettingsFile(p);
-                d[key] = val;
-                List<string> outLines = new List<string>();
-                foreach (KeyValuePair<string, string> kv in d) outLines.Add(kv.Key + "=" + kv.Value);
-                File.WriteAllLines(p, outLines.ToArray());
+                try
+                {
+                    string p = Path.Combine(Cfg.BaseDir, Proto.SettingsFileName);
+                    Dictionary<string, string> d = ReadSettingsFile(p);
+                    d[key] = val;
+                    List<string> outLines = new List<string>();
+                    foreach (KeyValuePair<string, string> kv in d) outLines.Add(kv.Key + "=" + kv.Value);
+                    Proto.WriteAllLinesAtomic(p, outLines.ToArray());
+                    string back = ReadSettingsKey(key);
+                    if (back == val) return;
+                }
+                catch (Exception) { }
+                System.Threading.Thread.Sleep(20);
             }
-            catch (Exception) { }
         }
 
         private void WriteState()

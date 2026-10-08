@@ -286,7 +286,7 @@ public class MapForm : Form
             string cfg = Path.Combine(dir, "config.ini");
             if (File.Exists(cfg))
             {
-                foreach (string ln in File.ReadAllLines(cfg))
+                foreach (string ln in Proto.ReadAllLinesShared(cfg))
                 {
                     string l = ln.Trim();
                     if (l.StartsWith("WorldRange=", StringComparison.OrdinalIgnoreCase))
@@ -355,6 +355,12 @@ public class MapForm : Form
         viewCX = 0; viewCZ = 0;
         // 启动就把当前图层写回设置文件: 模块的小地图跟随这个索引(也决定它去加载哪个 SNMapMini_*.jpg 预览)
         WriteSettingsKey(Proto.KeyWindowLayer, layerIdx.ToString());
+        // 自我修复: 这两个键只有窗口会写, 如果被别的写入撞车抹掉了(见 WriteSettingsKey 注释),
+        // 模块就永远收不到"重新打开"的指令 -> 表现成关掉之后再开就不显示。启动时补写一次。
+        if (Proto.ParseIniStrings(SettingsPath()).ContainsKey(Proto.KeyShowCreatures) == false)
+            WriteSettingsKey(Proto.KeyShowCreatures, showCreatures ? "1" : "0");
+        if (Proto.ParseIniStrings(SettingsPath()).ContainsKey(Proto.KeyShowScanSignals) == false)
+            WriteSettingsKey(Proto.KeyShowScanSignals, showScanSignals ? "1" : "0");
         WinLog("start auto=" + Program.AutoStart + " layers=" + layers.Count + " layer=" + layerIdx +
                " minimap=" + minimapPixels + " creatures=" + showCreatures + " scan=" + showScanSignals +
                " from=" + AppDomain.CurrentDomain.BaseDirectory);
@@ -471,9 +477,11 @@ public class MapForm : Form
 
     private void WriteSettingsKey(string key, string val)
     {
-        // 重试几次: 模块每 100ms 也会读这个文件, 撞上共享冲突时静默失败过一次,
-        // 玩家看到的就是"某个设置怎么都不生效"
-        for (int attempt = 0; attempt < 3; attempt++)
+        // 读-改-写整个设置文件, 而游戏内模块也会写同一个文件(按 F9 翻转 ShowWindow)。
+        // 原来用 File.WriteAllLines(先截断), 对方正好在这瞬间读就会拿到残缺的键集合,
+        // 回写时把对方的键抹掉(实测: ShowCreatures/ShowScanSignals 被抹掉 -> 设置窗口里开关怎么点都没反应)。
+        // 现在: 先写 .tmp 再原子替换 + 写完回读校验, 键丢了就重试。
+        for (int attempt = 0; attempt < 4; attempt++)
         {
             try
             {
@@ -482,14 +490,20 @@ public class MapForm : Form
                 d[key] = val;
                 List<string> outLines = new List<string>();
                 foreach (KeyValuePair<string, string> kv in d) outLines.Add(kv.Key + "=" + kv.Value);
-                File.WriteAllLines(p, outLines.ToArray());
+                Proto.WriteAllLinesAtomic(p, outLines.ToArray());
                 settingsStamp = DateTime.MinValue;
+                string back;
+                if (!Proto.ParseIniStrings(p).TryGetValue(key, out back) || back != val)
+                {
+                    System.Threading.Thread.Sleep(20);
+                    continue;
+                }
                 return;
             }
             catch (Exception ex)
             {
-                if (attempt == 2) WinLog("write settings failed: " + key + "=" + val + " (" + ex.Message + ")");
-                System.Threading.Thread.Sleep(15);
+                if (attempt == 3) WinLog("write settings failed: " + key + "=" + val + " (" + ex.Message + ")");
+                System.Threading.Thread.Sleep(20);
             }
         }
     }

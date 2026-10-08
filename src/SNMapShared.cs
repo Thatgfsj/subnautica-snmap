@@ -58,7 +58,7 @@ namespace SNMap
             try
             {
                 if (!File.Exists(path)) return res;
-                string[] lines = File.ReadAllLines(path);
+                string[] lines = ReadAllLinesShared(path);
                 for (int i = 0; i < lines.Length; i++)
                 {
                     string line = lines[i].Trim();
@@ -81,13 +81,39 @@ namespace SNMap
             return res;
         }
 
+        // 读文本行: 显式 FileShare.ReadWrite|Delete。
+        // 设置文件(SNMapSettings.ini)窗口和游戏内模块都会写, 而且都是"读-改-写整个文件"。
+        // 如果一方用 File.ReadAllLines(FileShare.Read) 或 File.WriteAllLines(先截断),
+        // 另一方就会读到半截文件、拿到残缺的键集合, 回写时把对方的键**抹掉**
+        // (实测: ShowCreatures / ShowScanSignals 被抹掉后, 设置窗口里开关怎么点都没反应)。
+        // 配套 WriteAllLinesAtomic: 先写 .tmp 再原子替换, 读方永远看到完整文件。
+        public static string[] ReadAllLinesShared(string path)
+        {
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (StreamReader sr = new StreamReader(fs, System.Text.Encoding.UTF8))
+            {
+                List<string> lines = new List<string>();
+                string l;
+                while ((l = sr.ReadLine()) != null) lines.Add(l);
+                return lines.ToArray();
+            }
+        }
+
+        public static void WriteAllLinesAtomic(string path, string[] lines)
+        {
+            string tmp = path + ".tmp";
+            File.WriteAllLines(tmp, lines);
+            if (File.Exists(path)) File.Replace(tmp, path, null);
+            else File.Move(tmp, path);
+        }
+
         public static Dictionary<string, string> ParseIniStrings(string path)
         {
             Dictionary<string, string> d = new Dictionary<string, string>();
             try
             {
                 if (!File.Exists(path)) return d;
-                string[] lines = File.ReadAllLines(path);
+                string[] lines = ReadAllLinesShared(path);
                 for (int i = 0; i < lines.Length; i++)
                 {
                     string line = lines[i].Trim();
