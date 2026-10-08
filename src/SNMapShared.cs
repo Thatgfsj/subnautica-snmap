@@ -20,9 +20,15 @@ namespace SNMap
         public const string KeyShowScanSignals = "ShowScanSignals";
         public const string KeyCreatureShow = "CreatureShow";   // 逗号分隔的 TechType 名(要显示的物种); "*"=全部
 
-        public const int Version = 4;           // v4: 信标/生物记录里加"图标键"(icons/<TechType>.png), 扫描信号也进大地图
+        // v5: 取消生物数量上限(24 -> 96), 状态文件相应变大 —— 偏移量全部由常量算出来,
+        //     模块与窗口都从这里取, 所以改这一个数字两边就一起变。旧窗口配新模块会因版本号不等被拒。
+        public const int Version = 5;
         public const int Magic = 0x534E4D50;
-        public const int StateSize = 8192;      // 状态文件固定长度(窗口复用读缓冲要用)
+
+        public const int MaxBeacons = 32;
+        public const int MaxCreatures = 96;     // 用户要求: 范围内有多少显示多少(白名单已把候选压到很少)
+        public const int MaxSpecies = 40;
+        public const int SpeciesStride = 32;
 
         public const int OffMagic = 0;          // int
         public const int OffVersion = 4;        // int
@@ -43,14 +49,10 @@ namespace SNMap
         public const int OffWindowLayerEcho = 4256; // int  模块回显(读自设置)
         public const int OffMinimapPixelsEcho = 4260; // int 模块回显
         public const int OffCreatureCount = 4268; // int 模块->窗口
-        public const int OffCreatures = 4272;   // 24 * 80B: x(f) z(4f) labelLen(8i) label(12+32B) keyLen(44i) key(48+32B)
-        public const int OffSpeciesCount = 6200; // int  模块见过的敌对物种数(供设置窗口列出全部敌对生物)
-        public const int OffSpecies = 6204;     // 40 * 32B: nameLen(i) + utf8 TechType 名(<=28B)
-
-        public const int MaxBeacons = 32;
-        public const int MaxCreatures = 24;
-        public const int MaxSpecies = 40;
-        public const int SpeciesStride = 32;
+        public const int OffCreatures = 4272;   // MaxCreatures * 80B: x(f) z(4f) labelLen(8i) label(12+32B) keyLen(44i) key(48+32B)
+        public const int OffSpeciesCount = OffCreatures + MaxCreatures * 80;      // int
+        public const int OffSpecies = OffSpeciesCount + 4;                        // MaxSpecies * 32B
+        public const int StateSize = OffSpecies + MaxSpecies * SpeciesStride + 64; // 状态文件固定长度(窗口复用读缓冲要用)
 
         public static Dictionary<string, float[]> ParseMapsIni(string path)
         {

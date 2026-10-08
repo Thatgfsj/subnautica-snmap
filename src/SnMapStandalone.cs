@@ -258,7 +258,7 @@ namespace SNMap
             BuildRingTexture(Cfg.MinimapPixels);
             LoadLayers();
             LoadPingsApi();
-            stateBuf = new byte[8192];
+            stateBuf = new byte[Proto.StateSize];
             modVerBytes = Encoding.UTF8.GetBytes(Cfg.Version);
             if (modVerBytes.Length > 32) Array.Resize(ref modVerBytes, 32);
 
