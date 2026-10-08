@@ -40,7 +40,7 @@ namespace SNMap
 
     internal static class Cfg
     {
-        public const string Version = "2.7m";  // 模块版本: 日志 + 状态文件; m=性能优化(注入后卡顿)
+        public const string Version = "2.7n";  // 模块版本: 日志 + 状态文件; n=生物显示修复(利维坦/漏显示/图标名额)
         public static string ToggleMapKey = "F9";
         public static string ToggleHudKey = "F7";
         public static int FontSize = 20;
@@ -224,6 +224,11 @@ namespace SNMap
         // 自检: 每 5 秒把各段耗时打到 SNMap.log(v2.7m 起)
         private float perfStateMs, perfBeaconMs, perfCreatureMs, perfDrawMs;
         private int perfFrames;
+        // v2.7n 生物显示相关
+        private readonly HashSet<string> skipLogged = new HashSet<string>();   // 被筛掉的物种只记一次, 不刷屏
+        private Type leviathanType;
+        private bool leviathanTried;
+        private int iconLoaded;                                                // 只数"真正载入成功"的图标
 
         private static readonly string[] Headings = new string[]
         {
@@ -667,11 +672,19 @@ namespace SNMap
                 Creature[] all = UnityEngine.Object.FindObjectsOfType<Creature>();
                 List<Creature> aggr = aggrCache;      // 复用, 不再每次扫描 new 一个 List
                 aggr.Clear();
-                foreach (Creature c in all)
+                for (int ci = 0; ci < all.Length; ci++)
                 {
+                    Creature c = all[ci];
                     if (c == null || !c.gameObject.activeInHierarchy) continue;
-                    if (c.GetComponent<AggressiveWhenSeeTarget>() == null && c.GetComponent<AttackLastTarget>() == null) continue;
                     TechTag tg = c.GetComponent<TechTag>();
+                    // v2.7n: 攻击组件原来只在根对象上找(GetComponent 不查子物体), 有些生物把 AI 挂子物体 ->
+                    // 整只被丢掉("部分生物加载不出来")。现在补一层 GetComponentInChildren。
+                    if (c.GetComponent<AggressiveWhenSeeTarget>() == null && c.GetComponent<AttackLastTarget>() == null &&
+                        c.GetComponentInChildren<AggressiveWhenSeeTarget>() == null && c.GetComponentInChildren<AttackLastTarget>() == null)
+                    {
+                        if (tg != null) LogSkipOnce(tg.type.ToString(), "没有攻击组件");
+                        continue;
+                    }
                     // 物种清单: 不管当前勾没勾显示, 见过就记下来(设置窗口要能列出全部敌对生物)
                     if (tg != null)
                     {
@@ -679,13 +692,29 @@ namespace SNMap
                         if (sp.Length > 0 && seenSpecies.Count < Proto.MaxSpecies && !seenSpecies.Contains(sp))
                             seenSpecies.Add(sp);
                     }
-                    if (!CreatureVisible(tg)) continue;
-                    if ((c.transform.position - pp).sqrMagnitude > 360000f) continue;
+                    if (!CreatureVisible(tg))
+                    {
+                        if (tg != null) LogSkipOnce(tg.type.ToString(), "设置里没勾选/不在白名单");
+                        continue;
+                    }
+                    // v2.7n: 距离上限 600m -> 1500m。利维坦又大又稀疏, 经常在 600m 外,
+                    // 大地图本来就能缩放平移看远处, 卡在 600m 会让"利维坦不显示"。
+                    float dsq = (c.transform.position - pp).sqrMagnitude;
+                    if (dsq > 2250000f)      // 1500m
+                    {
+                        if (tg != null) LogSkipOnce(tg.type.ToString(), "太远(>1500m)");
+                        continue;
+                    }
                     aggr.Add(c);
                 }
+                // v2.7n: 排序加权 —— 有利维坦组件的排最前。
+                // 原来是纯按距离取最近 24 个, 利维坦远处很容易被一群小鱼挤掉名额, 表现就是"利维坦不显示"。
+                EnsureLeviathanType();
                 aggr.Sort(delegate(Creature a, Creature b)
                 {
-                    return (a.transform.position - pp).sqrMagnitude.CompareTo((b.transform.position - pp).sqrMagnitude);
+                    float da = (a.transform.position - pp).sqrMagnitude - (IsLeviathan(a) ? 1e9f : 0f);
+                    float db = (b.transform.position - pp).sqrMagnitude - (IsLeviathan(b) ? 1e9f : 0f);
+                    return da.CompareTo(db);
                 });
                 int cn = Mathf.Min(aggr.Count, Proto.MaxCreatures);
                 PutInt(buf, Proto.OffCreatureCount, cn);
@@ -745,6 +774,33 @@ namespace SNMap
             if (creatureShow != null) return tg != null && creatureShow.Contains(tg.type.ToString());
             if (Cfg.CreatureWhitelist == null) return true;
             return tg != null && Cfg.CreatureWhitelist.Contains(tg.type);
+        }
+
+        // v2.7n 诊断: 某物种第一次因为某原因被筛掉时记一行(每物种每原因只记一次, 不刷屏)
+        private void LogSkipOnce(string species, string why)
+        {
+            if (skipLogged.Count >= 40) return;
+            string k = species + "|" + why;
+            if (skipLogged.Contains(k)) return;
+            skipLogged.Add(k);
+            Cfg.Log("creature skip: " + species + " -- " + why);
+        }
+
+        // Leviathan 是游戏标记"利维坦级"生物的组件(死神/幽灵/海龙都有), 用来给它们排序加权
+        private void EnsureLeviathanType()
+        {
+            if (leviathanTried) return;
+            leviathanTried = true;
+            try { leviathanType = typeof(Creature).Assembly.GetType("Leviathan"); }
+            catch (Exception) { }
+            Cfg.Log("leviathan component: " + (leviathanType != null ? "found" : "not found"));
+        }
+
+        private bool IsLeviathan(Creature c)
+        {
+            if (leviathanType == null) return false;
+            try { return c.GetComponent(leviathanType) != null; }
+            catch (Exception) { return false; }
         }
 
         // ---- 扫描室(Scanner Room)物品点 ----
@@ -1126,13 +1182,18 @@ namespace SNMap
             if (string.IsNullOrEmpty(key)) return null;
             Texture2D t;
             if (iconCache.TryGetValue(key, out t)) return t;
-            if (iconCache.Count >= 128) return null;     // 别把纹理无限堆着
+            // v2.7n: 上限只数"真正载入成功"的图标。
+            // 原来数的是字典条目数, 而"缺图"也会把 null 存进字典 -> 扫描室物品/信号点的一堆缺图 key
+            // 会把 128 个名额占满, 后面真正的生物头像再也载不进来(玩家看到的就是"部分生物加载不出来")。
+            // 上限同时放宽到 512(缩到 64px 后每张只有几十 KB)。
+            if (iconLoaded >= 512) return null;
             try
             {
                 string p = Path.Combine(Cfg.BaseDir, Path.Combine("icons", key + ".png"));
                 t = File.Exists(p) ? LoadIconTexture(p) : null;
             }
             catch (Exception) { t = null; }
+            if (t != null) iconLoaded++;
             iconCache[key] = t;
             return t;
         }

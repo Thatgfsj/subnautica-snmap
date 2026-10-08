@@ -1126,21 +1126,31 @@ public class MapForm : Form
         return h;
     }
 
-    // 内置图标(icons/<TechType>.png)按需加载 + 缓存; 没有图标就退回原来的点/三角
+    // 内置图标(icons/<TechType>.png)按需加载 + 缓存; 没有图标就退回"黑描边红感叹号"
     private readonly Dictionary<string, Image> iconCache = new Dictionary<string, Image>();
+    private int iconLoaded;                                   // v2.7n: 只数真正载入成功的
 
     private Image GetIcon(string key)
     {
         if (string.IsNullOrEmpty(key)) return null;
         Image img;
         if (iconCache.TryGetValue(key, out img)) return img;
-        if (iconCache.Count >= 256) return null;
+        // v2.7n: 上限只数"成功载入"的。原来数字典条目数, 而缺图也会存 null 进字典,
+        // 扫描室物品/信号点的一堆缺图 key 会把名额占满 -> 后面真正的生物头像载不进来("部分生物加载不出来")
+        if (iconLoaded >= 256) return null;
         try
         {
             string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, Path.Combine("icons", key + ".png"));
-            img = File.Exists(p) ? Image.FromFile(p) : null;
+            if (File.Exists(p))
+            {
+                // 读进内存再解码: Image.FromFile 会锁住文件(之前更新图标时被锁过)
+                byte[] raw = File.ReadAllBytes(p);
+                img = Image.FromStream(new MemoryStream(raw));
+            }
+            else img = null;
         }
         catch (Exception) { img = null; }
+        if (img != null) iconLoaded++;
         iconCache[key] = img;
         return img;
     }
